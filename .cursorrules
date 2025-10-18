@@ -1,0 +1,28 @@
+# Cursor AI Rules for TVT Project
+
+## Testing Enforcement
+- ALWAYS run `cargo test` after making any code changes
+- Write tests for every new feature before implementing it (TDD approach)
+- Ensure all tests pass before committing changes
+- Use `cargo test --verbose` to see detailed test output
+
+## Code Quality
+- Follow Rust naming conventions (snake_case for functions/variables, PascalCase for types)
+- Use `cargo clippy` to check for linting issues
+- Use `cargo fmt` to format code consistently
+- Add documentation comments for all public functions and types
+
+## Project Structure
+- Keep tests in the `tests/` directory for integration tests
+- Use `#[cfg(test)]` modules for unit tests within source files
+- Follow the established module structure: main.rs, analyzer.rs, hasher.rs, etc.
+
+## Error Handling
+- Use `anyhow::Result<T>` for error propagation
+- Provide meaningful error messages with context
+- Handle all possible error cases explicitly
+
+## Performance
+- Use parallel processing where appropriate (Rayon, Crossbeam)
+- Profile code with `cargo bench` for performance-critical sections
+- Monitor memory usage and avoid unnecessary allocations

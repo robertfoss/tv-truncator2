@@ -1,0 +1,42 @@
+[package]
+name = "tvt"
+version = "0.1.0"
+edition = "2021"
+description = "TV Truncator - Remove repetitive segments from TV show episodes"
+authors = ["Robert Foss <robert@example.com>"]
+
+[[bin]]
+name = "tvt"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
+img_hash = "3.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+indicatif = "0.17"
+rayon = "1.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+crossbeam = "0.8"
+dashmap = "6.1"
+num_cpus = "1.0"
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "process"] }
+chrono = { version = "0.4", features = ["serde"] }
+imageproc = "0.25"
+ndarray = "0.16"
+gstreamer = { version = "0.22", optional = true }
+gstreamer-app = { version = "0.22", optional = true }
+gstreamer-video = { version = "0.22", optional = true }
+gstreamer-pbutils = { version = "0.22", optional = true }
+
+[features]
+default = ["gstreamer"]
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-pbutils"]
+ffmpeg = []  # Keep old code path as fallback
+
+[dev-dependencies]
+tempfile = "3.10"
+assert_cmd = "2.0"
+predicates = "3.0"

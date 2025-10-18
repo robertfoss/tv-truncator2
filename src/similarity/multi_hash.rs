@@ -49,19 +49,19 @@ fn generate_dhash(img: &DynamicImage) -> Result<u64> {
     // Resize to 9x8 for dHash
     let resized = img.resize_exact(9, 8, image::imageops::FilterType::Lanczos3);
     let gray = resized.to_luma8();
-    
+
     let mut hash = 0u64;
     for y in 0..8 {
         for x in 0..8 {
             let left = gray.get_pixel(x, y)[0] as i32;
             let right = gray.get_pixel(x + 1, y)[0] as i32;
-            
+
             if left > right {
                 hash |= 1 << (y * 8 + x);
             }
         }
     }
-    
+
     Ok(hash)
 }
 
@@ -76,14 +76,14 @@ fn generate_ahash(img: &DynamicImage) -> Result<u64> {
     // Resize to 8x8
     let resized = img.resize_exact(8, 8, image::imageops::FilterType::Lanczos3);
     let gray = resized.to_luma8();
-    
+
     // Calculate average
     let mut sum = 0u32;
     for pixel in gray.pixels() {
         sum += pixel[0] as u32;
     }
     let avg = sum / 64;
-    
+
     // Generate hash
     let mut hash = 0u64;
     for (i, pixel) in gray.pixels().enumerate() {
@@ -91,7 +91,7 @@ fn generate_ahash(img: &DynamicImage) -> Result<u64> {
             hash |= 1 << i;
         }
     }
-    
+
     Ok(hash)
 }
 
@@ -100,48 +100,51 @@ fn generate_color_hash(img: &DynamicImage) -> Result<u64> {
     // Resize to 8x8 for color histogram
     let resized = img.resize_exact(8, 8, image::imageops::FilterType::Lanczos3);
     let rgb = resized.to_rgb8();
-    
+
     // Calculate color histogram (simplified)
     let mut r_sum = 0u32;
     let mut g_sum = 0u32;
     let mut b_sum = 0u32;
-    
+
     for pixel in rgb.pixels() {
         r_sum += pixel[0] as u32;
         g_sum += pixel[1] as u32;
         b_sum += pixel[2] as u32;
     }
-    
+
     let r_avg = r_sum / 64;
     let g_avg = g_sum / 64;
     let b_avg = b_sum / 64;
-    
+
     // Create hash from dominant colors
     let mut hash = 0u64;
     for pixel in rgb.pixels() {
         hash = hash.wrapping_mul(31);
-        if pixel[0] as u32 > r_avg { hash |= 1; }
-        if pixel[1] as u32 > g_avg { hash |= 2; }
-        if pixel[2] as u32 > b_avg { hash |= 4; }
+        if pixel[0] as u32 > r_avg {
+            hash |= 1;
+        }
+        if pixel[1] as u32 > g_avg {
+            hash |= 2;
+        }
+        if pixel[2] as u32 > b_avg {
+            hash |= 4;
+        }
     }
-    
+
     Ok(hash)
 }
 
 /// Adaptive threshold calculation based on content
-pub fn calculate_adaptive_threshold(
-    hashes: &[MultiScaleHash],
-    base_threshold: f64,
-) -> f64 {
+pub fn calculate_adaptive_threshold(hashes: &[MultiScaleHash], base_threshold: f64) -> f64 {
     if hashes.is_empty() {
         return base_threshold;
     }
-    
+
     // Calculate content complexity metrics
     let mut complexity_scores = Vec::new();
     let mut motion_scores = Vec::new();
     let mut color_variance = Vec::new();
-    
+
     for (i, hash) in hashes.iter().enumerate() {
         // Scene complexity (based on hash diversity)
         if i > 0 {
@@ -149,27 +152,29 @@ pub fn calculate_adaptive_threshold(
             let complexity = calculate_similarity_score(hash, prev_hash);
             complexity_scores.push(1.0 - complexity);
         }
-        
+
         // Motion level (temporal changes)
         if i > 0 {
             let motion = (hash.dhash ^ hashes[i - 1].dhash).count_ones() as f64 / 64.0;
             motion_scores.push(motion);
         }
-        
+
         // Color variance (simplified)
         let color_variance_score = (hash.color_hash.count_ones() as f64) / 64.0;
         color_variance.push(color_variance_score);
     }
-    
+
     // Calculate adaptive threshold
-    let avg_complexity = complexity_scores.iter().sum::<f64>() / complexity_scores.len().max(1) as f64;
+    let avg_complexity =
+        complexity_scores.iter().sum::<f64>() / complexity_scores.len().max(1) as f64;
     let avg_motion = motion_scores.iter().sum::<f64>() / motion_scores.len().max(1) as f64;
-    let avg_color_variance = color_variance.iter().sum::<f64>() / color_variance.len().max(1) as f64;
-    
+    let avg_color_variance =
+        color_variance.iter().sum::<f64>() / color_variance.len().max(1) as f64;
+
     // Adjust threshold based on content characteristics
     let adjustment = (avg_complexity * 0.3 + avg_motion * 0.4 + avg_color_variance * 0.3) * 0.1;
     let adaptive_threshold = base_threshold - adjustment;
-    
+
     // Clamp between reasonable bounds
     adaptive_threshold.max(0.5).min(0.95)
 }

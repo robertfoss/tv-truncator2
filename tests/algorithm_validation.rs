@@ -1,11 +1,11 @@
 //! Algorithm validation tests using synthetic test samples
 
-use std::path::{Path, PathBuf};
-use std::fs;
 use serde_json;
-use tvt::{Config, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
 use tvt::parallel::process_files_parallel;
 use tvt::similarity::SimilarityAlgorithm;
+use tvt::{Config, Result};
 
 /// Test configuration for algorithm validation
 #[derive(Debug, Clone)]
@@ -77,6 +77,7 @@ fn run_detection(
         similarity: 90,
         similarity_threshold: test_config.similarity_threshold,
         similarity_algorithm: algorithm,
+        extractor_type: tvt::ExtractorType::Legacy,
         dry_run: true, // Don't actually create output files
         quick: false,
         verbose: false,
@@ -97,7 +98,7 @@ fn run_detection(
 
     // Process files and get segments
     let _processors = process_files_parallel(video_files, config)?;
-    
+
     // For now, return empty segments since we need to extract them from the processing
     // In a real implementation, we'd need to modify the parallel processing to return segments
     Ok(vec![])
@@ -135,7 +136,7 @@ fn test_algorithm_on_case(
 fn get_synthetic_test_dirs() -> Result<Vec<std::path::PathBuf>> {
     let synthetic_dir = Path::new("tests/samples/synthetic");
     let mut test_dirs = Vec::new();
-    
+
     for entry in fs::read_dir(synthetic_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -143,7 +144,7 @@ fn get_synthetic_test_dirs() -> Result<Vec<std::path::PathBuf>> {
             test_dirs.push(path);
         }
     }
-    
+
     test_dirs.sort();
     Ok(test_dirs)
 }
@@ -151,7 +152,7 @@ fn get_synthetic_test_dirs() -> Result<Vec<std::path::PathBuf>> {
 /// Parameter matrix for testing
 fn get_parameter_matrix() -> Vec<TestConfig> {
     let mut configs = Vec::new();
-    
+
     for similarity_threshold in [0.70, 0.75, 0.80, 0.85, 0.90] {
         for min_duration in [1.0, 5.0, 10.0, 30.0] {
             for threshold in [2, 3, 4] {
@@ -164,7 +165,7 @@ fn get_parameter_matrix() -> Vec<TestConfig> {
             }
         }
     }
-    
+
     configs
 }
 
@@ -177,38 +178,61 @@ fn test_synthetic_samples() -> Result<()> {
         SimilarityAlgorithm::SsimFeatures,
     ];
     let parameter_matrix = get_parameter_matrix();
-    
+
     println!("Running algorithm validation tests...");
     println!("Found {} test directories", test_dirs.len());
-    println!("Testing {} algorithms with {} parameter combinations", 
-             algorithms.len(), parameter_matrix.len());
-    
+    println!(
+        "Testing {} algorithms with {} parameter combinations",
+        algorithms.len(),
+        parameter_matrix.len()
+    );
+
     for test_dir in &test_dirs {
         let test_case = load_test_case(test_dir)?;
-        println!("\nTesting: {} - {}", test_case.test_name, test_case.description);
-        
+        println!(
+            "\nTesting: {} - {}",
+            test_case.test_name, test_case.description
+        );
+
         for algorithm in &algorithms {
             println!("  Algorithm: {:?}", algorithm);
-            
+
             // Test with default parameters first
             let default_config = TestConfig::default();
             match test_algorithm_on_case(test_dir, algorithm.clone(), &default_config) {
                 Ok(metrics) => {
-                    println!("    Default params - Precision: {:.3}, Recall: {:.3}, F1: {:.3}", 
-                             metrics.precision, metrics.recall, metrics.f1_score);
+                    println!(
+                        "    Default params - Precision: {:.3}, Recall: {:.3}, F1: {:.3}",
+                        metrics.precision, metrics.recall, metrics.f1_score
+                    );
                 }
                 Err(e) => {
                     println!("    Default params - Error: {}", e);
                 }
             }
-            
+
             // Test with a few key parameter combinations
             let key_configs = [
-                TestConfig { similarity_threshold: 0.70, min_duration: 1.0, threshold: 2, parallel_workers: 3 },
-                TestConfig { similarity_threshold: 0.80, min_duration: 10.0, threshold: 3, parallel_workers: 3 },
-                TestConfig { similarity_threshold: 0.90, min_duration: 30.0, threshold: 4, parallel_workers: 3 },
+                TestConfig {
+                    similarity_threshold: 0.70,
+                    min_duration: 1.0,
+                    threshold: 2,
+                    parallel_workers: 3,
+                },
+                TestConfig {
+                    similarity_threshold: 0.80,
+                    min_duration: 10.0,
+                    threshold: 3,
+                    parallel_workers: 3,
+                },
+                TestConfig {
+                    similarity_threshold: 0.90,
+                    min_duration: 30.0,
+                    threshold: 4,
+                    parallel_workers: 3,
+                },
             ];
-            
+
             for config in &key_configs {
                 match test_algorithm_on_case(test_dir, algorithm.clone(), config) {
                     Ok(metrics) => {
@@ -217,14 +241,16 @@ fn test_synthetic_samples() -> Result<()> {
                                  metrics.precision, metrics.recall, metrics.f1_score);
                     }
                     Err(e) => {
-                        println!("    Params {:.2}/{:.0}/{} - Error: {}", 
-                                 config.similarity_threshold, config.min_duration, config.threshold, e);
+                        println!(
+                            "    Params {:.2}/{:.0}/{} - Error: {}",
+                            config.similarity_threshold, config.min_duration, config.threshold, e
+                        );
                     }
                 }
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -232,18 +258,18 @@ fn test_synthetic_samples() -> Result<()> {
 fn test_full_duplicates_current_algorithm() -> Result<()> {
     let test_dir = Path::new("tests/samples/synthetic/full_duplicates");
     let test_case = load_test_case(test_dir)?;
-    
+
     // Test that we can load the test case
     assert_eq!(test_case.test_name, "full_duplicates");
     assert_eq!(test_case.files.len(), 3);
     assert_eq!(test_case.expected_segments.len(), 1);
-    
+
     // Test that the expected segment covers the full video
     let expected_segment = &test_case.expected_segments[0];
     assert_eq!(expected_segment.start_time, 0.0);
     assert!(expected_segment.end_time > 25.0); // Should be around 30 seconds
     assert_eq!(expected_segment.files.len(), 3);
-    
+
     Ok(())
 }
 
@@ -251,17 +277,17 @@ fn test_full_duplicates_current_algorithm() -> Result<()> {
 fn test_opening_credits_current_algorithm() -> Result<()> {
     let test_dir = Path::new("tests/samples/synthetic/opening_credits");
     let test_case = load_test_case(test_dir)?;
-    
+
     // Test that we can load the test case
     assert_eq!(test_case.test_name, "opening_credits");
     assert!(test_case.files.len() >= 3); // At least 3 video files
     assert_eq!(test_case.expected_segments.len(), 1);
-    
+
     // Test that the expected segment is a short opening
     let expected_segment = &test_case.expected_segments[0];
     assert_eq!(expected_segment.start_time, 0.0);
     assert!(expected_segment.end_time <= 60.0); // Should be a short opening
     assert_eq!(expected_segment.files.len(), 3);
-    
+
     Ok(())
 }

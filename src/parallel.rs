@@ -2,6 +2,7 @@
 
 use crate::analyzer::{get_video_info, EpisodeFrames, VideoInfo};
 use crate::gstreamer_extractor::{extract_frames_gstreamer, get_video_duration_gstreamer};
+use crate::gstreamer_extractor_v2::extract_frames_gstreamer_v2;
 use crate::progress_display::spawn_progress_display;
 use crate::segment_detector::{detect_common_segments, merge_overlapping_segments};
 use crate::state_machine::{FileProcessor, ProcessingState};
@@ -24,7 +25,12 @@ pub fn process_files_parallel(
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase()
-            .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+            .cmp(
+                &b.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
     });
 
     // Create FileProcessor for each file
@@ -59,44 +65,44 @@ fn process_pipeline(
 ) -> Result<()> {
     // Phase 1: Probe all files
     probe_all_files(&processors_arc, config)?;
-    
+
     // SYNC POINT 1: Wait for all files to reach Probed state
     coordinator.wait_for_sync(SyncPoint::AfterProbed)?;
-    
+
     // Phase 2: Extract frames in parallel
     extract_frames_parallel(&processors_arc, config)?;
-    
+
     // Phase 3: Analyze frames in parallel
     analyze_frames_parallel(&processors_arc, config)?;
-    
+
     // SYNC POINT 2: Wait for all files to reach Analyzed state
     coordinator.wait_for_sync(SyncPoint::AfterAnalyzed)?;
-    
+
     // Phase 4: Find repeated segments globally
     find_repeated_segments(&processors_arc, config)?;
-    
+
     // Phase 5: Cut files in parallel
     cut_files_parallel(&processors_arc, config)?;
-    
+
     Ok(())
 }
 
 /// Probe all video files to get metadata in parallel
-fn probe_all_files(
-    processors_arc: &Arc<Mutex<Vec<FileProcessor>>>,
-    config: &Config,
-) -> Result<()> {
+fn probe_all_files(processors_arc: &Arc<Mutex<Vec<FileProcessor>>>, config: &Config) -> Result<()> {
     let file_paths = {
         let processors_guard = processors_arc.lock().unwrap();
-        processors_guard.iter().map(|p| p.file_path.clone()).collect::<Vec<_>>()
+        processors_guard
+            .iter()
+            .map(|p| p.file_path.clone())
+            .collect::<Vec<_>>()
     };
-    
+
     // Create thread pool with limited workers
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.parallel_workers)
         .build()
         .unwrap();
-    
+
     pool.install(|| {
         file_paths.par_iter().for_each(|file_path| {
             if let Err(e) = probe_single_file(file_path, processors_arc, config) {
@@ -104,7 +110,7 @@ fn probe_all_files(
             }
         });
     });
-    
+
     Ok(())
 }
 
@@ -118,14 +124,17 @@ fn probe_single_file(
     update_processor_state(processors_arc, file_path, |p| {
         p.transition_to(ProcessingState::Probing { progress: 0.0 });
     })?;
-    
+
     if config.debug {
-        println!("🔄 Started probing: {}", file_path.file_name().unwrap_or_default().to_string_lossy());
+        println!(
+            "🔄 Started probing: {}",
+            file_path.file_name().unwrap_or_default().to_string_lossy()
+        );
     }
-    
+
     // Add a small delay to make the state visible
     std::thread::sleep(std::time::Duration::from_millis(100));
-    
+
     // Probe the video
     match get_video_info(file_path) {
         Ok(video_info) => {
@@ -133,23 +142,25 @@ fn probe_single_file(
             update_processor_state(processors_arc, file_path, |p| {
                 p.update_probing(1.0);
             })?;
-            
+
             // Add a small delay to make the state visible
             std::thread::sleep(std::time::Duration::from_millis(100));
-            
+
             // Transition to Probed state
             let estimated_frames = estimate_frame_count(&video_info, config);
             update_processor_state(processors_arc, file_path, |p| {
                 p.set_video_info(video_info);
-                p.transition_to(ProcessingState::Probed { 
-                    frames_total: estimated_frames 
+                p.transition_to(ProcessingState::Probed {
+                    frames_total: estimated_frames,
                 });
             })?;
-            
+
             if config.debug {
-                println!("🔄 Completed probing: {} ({} frames estimated)", 
-                    file_path.file_name().unwrap_or_default().to_string_lossy(), 
-                    estimated_frames);
+                println!(
+                    "🔄 Completed probing: {} ({} frames estimated)",
+                    file_path.file_name().unwrap_or_default().to_string_lossy(),
+                    estimated_frames
+                );
             }
         }
         Err(e) => {
@@ -159,7 +170,7 @@ fn probe_single_file(
             return Err(e);
         }
     }
-    
+
     Ok(())
 }
 
@@ -170,15 +181,18 @@ fn extract_frames_parallel(
 ) -> Result<()> {
     let file_paths = {
         let processors_guard = processors_arc.lock().unwrap();
-        processors_guard.iter().map(|p| p.file_path.clone()).collect::<Vec<_>>()
+        processors_guard
+            .iter()
+            .map(|p| p.file_path.clone())
+            .collect::<Vec<_>>()
     };
-    
+
     // Create thread pool with limited workers
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.parallel_workers)
         .build()
         .unwrap();
-    
+
     pool.install(|| {
         file_paths.par_iter().for_each(|file_path| {
             if let Err(e) = extract_single_file(file_path, processors_arc, config) {
@@ -186,7 +200,7 @@ fn extract_frames_parallel(
             }
         });
     });
-    
+
     Ok(())
 }
 
@@ -198,7 +212,7 @@ fn extract_single_file(
 ) -> Result<()> {
     // Get video info
     let video_info = get_processor_video_info(processors_arc, file_path)?;
-    
+
     // Transition to Extracting state
     let estimated_frames = estimate_frame_count(&video_info, config);
     update_processor_state(processors_arc, file_path, |p| {
@@ -207,23 +221,21 @@ fn extract_single_file(
             frames_total: estimated_frames,
         });
     })?;
-    
+
     if config.debug {
-        println!("🔄 Started extracting: {} ({} frames)", 
-            file_path.file_name().unwrap_or_default().to_string_lossy(), 
-            estimated_frames);
+        println!(
+            "🔄 Started extracting: {} ({} frames)",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            estimated_frames
+        );
     }
-    
+
     // Extract frames with progress tracking
     let sample_rate = if config.quick { 0.5 } else { 5.0 };
-    let frames = extract_frames_with_state_machine_progress(
-        file_path, 
-        sample_rate, 
-        processors_arc, 
-        config
-    )?;
+    let frames =
+        extract_frames_with_state_machine_progress(file_path, sample_rate, processors_arc, config)?;
     let actual_frame_count = frames.frames.len();
-    
+
     // Transition to Extracted state
     update_processor_state(processors_arc, file_path, |p| {
         p.set_frames(frames);
@@ -232,13 +244,15 @@ fn extract_single_file(
             frames_total: actual_frame_count,
         });
     })?;
-    
+
     if config.debug {
-        println!("🔄 Completed extracting: {} ({} frames extracted)", 
-            file_path.file_name().unwrap_or_default().to_string_lossy(), 
-            actual_frame_count);
+        println!(
+            "🔄 Completed extracting: {} ({} frames extracted)",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            actual_frame_count
+        );
     }
-    
+
     Ok(())
 }
 
@@ -252,46 +266,79 @@ fn extract_frames_with_state_machine_progress(
     use std::time::Instant;
 
     let extraction_start = Instant::now();
-    
+
     // Get video duration for progress calculation using GStreamer
     let duration_start = Instant::now();
     let duration = get_video_duration_gstreamer(video_path, config)?;
     let duration_time = duration_start.elapsed();
     let _expected_frames = (duration * sample_rate) as usize;
-    
+
     if config.debug {
         println!("🕐 Duration extraction: {:?}", duration_time);
     }
-    
+
     // Clone data needed for the callback
     let video_path_clone = video_path.clone();
     let processors_arc_clone = processors_arc.clone();
     let video_path_for_callback = video_path_clone.clone();
-    
-    // Extract frames using GStreamer with progress callback
-    let frames = extract_frames_gstreamer(
-        &video_path_clone,
-        sample_rate,
-        move |current, total| {
-            // Update the state machine with current progress
-            if let Err(e) = update_processor_state(&processors_arc_clone, &video_path_for_callback, |p| {
-                p.update_extracting(current, total);
-            }) {
-                eprintln!("Failed to update processor state: {}", e);
-            }
-        },
-        config,
-    )?;
-    
+
+    // Extract frames using selected extractor with progress callback
+    let frames = match config.extractor_type {
+        crate::ExtractorType::Legacy => {
+            extract_frames_gstreamer(
+                &video_path_clone,
+                sample_rate,
+                move |current, total| {
+                    // Update the state machine with current progress
+                    if let Err(e) = update_processor_state(
+                        &processors_arc_clone,
+                        &video_path_for_callback,
+                        |p| {
+                            p.update_extracting(current, total);
+                        },
+                    ) {
+                        eprintln!("Failed to update processor state: {}", e);
+                    }
+                },
+                config,
+            )?
+        }
+        crate::ExtractorType::Optimized => {
+            let processors_arc_clone_v2 = processors_arc.clone();
+            let video_path_for_callback_v2 = video_path.clone();
+            extract_frames_gstreamer_v2(
+                &video_path,
+                sample_rate,
+                move |current, total| {
+                    // Update the state machine with current progress
+                    if let Err(e) = update_processor_state(
+                        &processors_arc_clone_v2,
+                        &video_path_for_callback_v2,
+                        |p| {
+                            p.update_extracting(current, total);
+                        },
+                    ) {
+                        eprintln!("Failed to update processor state: {}", e);
+                    }
+                },
+                config,
+            )?
+        }
+    };
+
     let total_extraction_time = extraction_start.elapsed();
-    
+
     if config.debug {
         println!("🕐 GStreamer extraction: {:?}", total_extraction_time);
-        println!("🕐 Breakdown: Duration={:.2}%, Extraction={:.2}%", 
-                 duration_time.as_secs_f64() / total_extraction_time.as_secs_f64() * 100.0,
-                 (total_extraction_time - duration_time).as_secs_f64() / total_extraction_time.as_secs_f64() * 100.0);
+        println!(
+            "🕐 Breakdown: Duration={:.2}%, Extraction={:.2}%",
+            duration_time.as_secs_f64() / total_extraction_time.as_secs_f64() * 100.0,
+            (total_extraction_time - duration_time).as_secs_f64()
+                / total_extraction_time.as_secs_f64()
+                * 100.0
+        );
     }
-    
+
     Ok(EpisodeFrames {
         episode_path: video_path.clone(),
         frames,
@@ -306,18 +353,21 @@ fn analyze_frames_parallel(
     if config.debug {
         println!("🔄 Starting analysis phase...");
     }
-    
+
     let file_paths = {
         let processors_guard = processors_arc.lock().unwrap();
-        processors_guard.iter().map(|p| p.file_path.clone()).collect::<Vec<_>>()
+        processors_guard
+            .iter()
+            .map(|p| p.file_path.clone())
+            .collect::<Vec<_>>()
     };
-    
+
     // Create thread pool with limited workers
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.parallel_workers)
         .build()
         .unwrap();
-    
+
     pool.install(|| {
         file_paths.par_iter().for_each(|file_path| {
             if let Err(e) = analyze_single_file(file_path, processors_arc, config) {
@@ -325,11 +375,11 @@ fn analyze_frames_parallel(
             }
         });
     });
-    
+
     if config.debug {
         println!("🔄 Completed analysis phase...");
     }
-    
+
     Ok(())
 }
 
@@ -340,12 +390,15 @@ fn analyze_single_file(
     config: &Config,
 ) -> Result<()> {
     if config.debug {
-        println!("🔄 Started analyzing: {}", file_path.file_name().unwrap_or_default().to_string_lossy());
+        println!(
+            "🔄 Started analyzing: {}",
+            file_path.file_name().unwrap_or_default().to_string_lossy()
+        );
     }
-    
+
     // Get frames
     let frames = get_processor_frames(processors_arc, file_path)?;
-    
+
     // Transition to Analyzing state
     let total_frames = frames.frames.len();
     update_processor_state(processors_arc, file_path, |p| {
@@ -354,18 +407,14 @@ fn analyze_single_file(
             frames_total: total_frames,
         });
     })?;
-    
+
     // Add a small delay to make the state visible
     std::thread::sleep(std::time::Duration::from_millis(100));
-    
+
     // Perform actual frame analysis with progress tracking
-    let analysis_results = analyze_frames_for_patterns_with_progress(
-        &frames, 
-        processors_arc, 
-        file_path, 
-        config
-    )?;
-    
+    let analysis_results =
+        analyze_frames_for_patterns_with_progress(&frames, processors_arc, file_path, config)?;
+
     // Transition to Analyzed state
     update_processor_state(processors_arc, file_path, |p| {
         p.set_analysis_results(analysis_results);
@@ -374,13 +423,15 @@ fn analyze_single_file(
             frames_total: total_frames,
         });
     })?;
-    
+
     if config.debug {
-        println!("🔄 Completed analyzing: {} ({} frames analyzed)", 
-            file_path.file_name().unwrap_or_default().to_string_lossy(), 
-            total_frames);
+        println!(
+            "🔄 Completed analyzing: {} ({} frames analyzed)",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            total_frames
+        );
     }
-    
+
     Ok(())
 }
 
@@ -393,7 +444,7 @@ fn find_repeated_segments(
     let all_frames = {
         let processors_guard = processors_arc.lock().unwrap();
         let mut frames = Vec::new();
-        
+
         for processor in processors_guard.iter() {
             if let Some(ref file_frames) = processor.frames {
                 frames.push(file_frames.clone());
@@ -401,11 +452,11 @@ fn find_repeated_segments(
         }
         frames
     };
-    
+
     if all_frames.is_empty() {
         return Ok(());
     }
-    
+
     // Update all processors to FindingRepeated state
     {
         let mut processors_guard = processors_arc.lock().unwrap();
@@ -415,11 +466,11 @@ fn find_repeated_segments(
             }
         }
     }
-    
+
     // Detect common segments
     let common_segments = detect_common_segments(&all_frames, config, config.debug_dupes)?;
     let merged_segments = merge_overlapping_segments(common_segments);
-    
+
     // Update all processors with duplicate segments
     {
         let mut processors_guard = processors_arc.lock().unwrap();
@@ -435,7 +486,7 @@ fn find_repeated_segments(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -446,15 +497,18 @@ fn cut_files_parallel(
 ) -> Result<()> {
     let file_paths = {
         let processors_guard = processors_arc.lock().unwrap();
-        processors_guard.iter().map(|p| p.file_path.clone()).collect::<Vec<_>>()
+        processors_guard
+            .iter()
+            .map(|p| p.file_path.clone())
+            .collect::<Vec<_>>()
     };
-    
+
     // Create thread pool with limited workers
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(config.parallel_workers)
         .build()
         .unwrap();
-    
+
     pool.install(|| {
         file_paths.par_iter().for_each(|file_path| {
             if let Err(e) = cut_single_file(file_path, processors_arc, config) {
@@ -462,7 +516,7 @@ fn cut_files_parallel(
             }
         });
     });
-    
+
     Ok(())
 }
 
@@ -474,7 +528,7 @@ fn cut_single_file(
 ) -> Result<()> {
     // Get duplicates
     let duplicates = get_processor_duplicates(processors_arc, file_path)?;
-    
+
     if config.dry_run {
         // In dry run, just mark as done
         update_processor_state(processors_arc, file_path, |p| {
@@ -482,28 +536,28 @@ fn cut_single_file(
         })?;
         return Ok(());
     }
-    
+
     // Create output directory
     std::fs::create_dir_all(&config.output_dir)?;
-    
+
     // Generate output filename
     let filename = file_path.file_name().unwrap_or_default();
     let output_path = config.output_dir.join(filename);
-    
+
     // Update progress
     update_processor_state(processors_arc, file_path, |p| {
         p.update_cutting(0.5);
     })?;
-    
+
     // Cut the video
     cut_video_segments(file_path, &output_path, &duplicates)?;
-    
+
     // Update progress and mark as done
     update_processor_state(processors_arc, file_path, |p| {
         p.update_cutting(1.0);
         p.complete(output_path);
     })?;
-    
+
     Ok(())
 }
 
@@ -518,7 +572,10 @@ where
     F: FnOnce(&mut FileProcessor),
 {
     let mut processors_guard = processors_arc.lock().unwrap();
-    if let Some(processor) = processors_guard.iter_mut().find(|p| p.file_path == *file_path) {
+    if let Some(processor) = processors_guard
+        .iter_mut()
+        .find(|p| p.file_path == *file_path)
+    {
         update_fn(processor);
     }
     Ok(())
@@ -530,7 +587,10 @@ fn get_processor_video_info(
 ) -> Result<VideoInfo> {
     let processors_guard = processors_arc.lock().unwrap();
     if let Some(processor) = processors_guard.iter().find(|p| p.file_path == *file_path) {
-        processor.video_info.clone().ok_or_else(|| anyhow::anyhow!("Video info not available"))
+        processor
+            .video_info
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Video info not available"))
     } else {
         Err(anyhow::anyhow!("File not found in processors"))
     }
@@ -542,7 +602,10 @@ fn get_processor_frames(
 ) -> Result<EpisodeFrames> {
     let processors_guard = processors_arc.lock().unwrap();
     if let Some(processor) = processors_guard.iter().find(|p| p.file_path == *file_path) {
-        processor.frames.clone().ok_or_else(|| anyhow::anyhow!("Frames not available"))
+        processor
+            .frames
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Frames not available"))
     } else {
         Err(anyhow::anyhow!("File not found in processors"))
     }
@@ -574,13 +637,13 @@ fn analyze_frames_for_patterns_with_progress(
     _config: &Config,
 ) -> Result<Vec<u64>> {
     use crate::hasher::RollingHash;
-    
+
     let total_frames = frames.frames.len();
     let mut analysis_results = Vec::with_capacity(total_frames);
-    
+
     // Use a window size of 5 for rolling hash
     let mut rolling_hash = RollingHash::new(5);
-    
+
     for (i, frame) in frames.frames.iter().enumerate() {
         // Add frame hash to rolling hash
         if let Some(hash_value) = rolling_hash.add(frame.perceptual_hash) {
@@ -589,18 +652,18 @@ fn analyze_frames_for_patterns_with_progress(
             // Window not full yet, use the frame hash directly
             analysis_results.push(frame.perceptual_hash);
         }
-        
+
         // Update progress every 5 frames or on the last frame
         if i % 5 == 0 || i == total_frames - 1 {
             update_processor_state(processors_arc, file_path, |p| {
                 p.update_analyzing(i + 1, total_frames);
             })?;
-            
+
             // Add a small delay to make progress visible
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    
+
     Ok(analysis_results)
 }
 
@@ -610,11 +673,10 @@ fn _analyze_frames_for_patterns(frames: &EpisodeFrames, _config: &Config) -> Res
     Ok(vec![0u64; frames.frames.len()])
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_estimate_frame_count() {
         let video_info = VideoInfo {
@@ -624,15 +686,27 @@ mod tests {
             fps: 30.0,
             bitrate: Some(5000000),
         };
-        
-        let dry_run_config = Config { dry_run: true, quick: false, ..Config::default() };
-        let quick_config = Config { dry_run: false, quick: true, ..Config::default() };
-        let normal_config = Config { dry_run: false, quick: false, ..Config::default() };
-        
+
+        let dry_run_config = Config {
+            dry_run: true,
+            quick: false,
+            ..Config::default()
+        };
+        let quick_config = Config {
+            dry_run: false,
+            quick: true,
+            ..Config::default()
+        };
+        let normal_config = Config {
+            dry_run: false,
+            quick: false,
+            ..Config::default()
+        };
+
         let dry_run_frames = estimate_frame_count(&video_info, &dry_run_config);
         let quick_frames = estimate_frame_count(&video_info, &quick_config);
         let normal_frames = estimate_frame_count(&video_info, &normal_config);
-        
+
         assert_eq!(dry_run_frames, 500); // 100 * 5.0 (same as normal mode)
         assert_eq!(quick_frames, 50); // 100 * 0.5
         assert_eq!(normal_frames, 500); // 100 * 5.0

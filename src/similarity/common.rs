@@ -20,7 +20,7 @@ pub enum SimilarityAlgorithm {
 #[derive(Debug, Clone)]
 pub struct EpisodeSegment {
     pub episode_name: String,
-    pub start_time: f64,  // Can differ per episode (temporal shift)
+    pub start_time: f64, // Can differ per episode (temporal shift)
     pub end_time: f64,
 }
 
@@ -29,10 +29,10 @@ pub struct EpisodeSegment {
 pub struct CommonSegment {
     pub start_time: f64,
     pub end_time: f64,
-    pub episode_segments: Vec<EpisodeSegment>,  // New: per-episode timing
+    pub episode_segments: Vec<EpisodeSegment>, // New: per-episode timing
     pub confidence: f64,
-    pub algorithm: String,  // Which algorithm detected it
-    pub similarity_scores: HashMap<String, f64>,  // Detailed metrics
+    pub algorithm: String,                       // Which algorithm detected it
+    pub similarity_scores: HashMap<String, f64>, // Detailed metrics
 }
 
 /// Scene segment for pre-processing
@@ -42,7 +42,7 @@ pub struct SceneSegment {
     pub end_frame: usize,
     pub start_time: f64,
     pub end_time: f64,
-    pub complexity: f64,  // Scene complexity score
+    pub complexity: f64, // Scene complexity score
 }
 
 /// Keypoint for feature matching
@@ -78,7 +78,7 @@ pub struct ComparisonMetrics {
 pub struct AlgorithmComparison {
     pub multi_hash_results: Vec<CommonSegment>,
     pub ssim_features_results: Vec<CommonSegment>,
-    pub agreement: Vec<CommonSegment>,  // Found by both
+    pub agreement: Vec<CommonSegment>, // Found by both
     pub multi_hash_only: Vec<CommonSegment>,
     pub ssim_features_only: Vec<CommonSegment>,
     pub metrics: ComparisonMetrics,

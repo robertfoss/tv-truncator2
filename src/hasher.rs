@@ -1,6 +1,5 @@
 //! Perceptual hashing and Rabin-Karp rolling hash implementation
 
-
 /// Rabin-Karp rolling hash implementation
 pub struct RollingHash {
     prime: u64,
@@ -30,7 +29,7 @@ impl RollingHash {
         if self.position < self.window_size {
             self.window[self.position] = value;
             self.position += 1;
-            
+
             // Return hash only when window is full
             if self.position == self.window_size {
                 // Calculate initial hash
@@ -46,19 +45,19 @@ impl RollingHash {
             // Window is full, do rolling hash
             // Remove the oldest value (at position 0)
             let old_value = self.window[0];
-            
+
             // Shift all values left
             for i in 0..self.window_size - 1 {
                 self.window[i] = self.window[i + 1];
             }
-            
+
             // Add new value at the end
             self.window[self.window_size - 1] = value;
-            
+
             // Update hash: remove old value, add new value
             self.current_hash = (self.current_hash + self.modulus - old_value) % self.modulus;
             self.current_hash = (self.current_hash * self.prime + value) % self.modulus;
-            
+
             Some(self.current_hash)
         }
     }
@@ -88,19 +87,19 @@ mod tests {
     #[test]
     fn test_rolling_hash_basic() {
         let mut rh = RollingHash::new(3);
-        
+
         // Add values until window is full
         assert_eq!(rh.add(1), None);
         assert_eq!(rh.add(2), None);
         let hash1 = rh.add(3);
         assert!(hash1.is_some()); // Should return hash when window is full
-        
+
         // Continue adding
         let hash2 = rh.add(4);
         assert!(hash2.is_some()); // Rolling window: [2, 3, 4]
         let hash3 = rh.add(5);
         assert!(hash3.is_some()); // Rolling window: [3, 4, 5]
-        
+
         // Hashes should be different
         assert_ne!(hash1, hash2);
         assert_ne!(hash2, hash3);
@@ -109,18 +108,18 @@ mod tests {
     #[test]
     fn test_rolling_hash_reset() {
         let mut rh = RollingHash::new(2);
-        
+
         rh.add(1);
         let hash1 = rh.add(2);
         assert!(hash1.is_some()); // Window full
         println!("Hash1: {:?}", hash1);
-        
+
         rh.reset();
         assert_eq!(rh.add(100), None);
         let hash2 = rh.add(200);
         assert!(hash2.is_some()); // Fresh start
         println!("Hash2: {:?}", hash2);
-        
+
         // For now, just test that both hashes exist
         // TODO: Fix the rolling hash algorithm to produce different hashes
         assert!(hash1.is_some());

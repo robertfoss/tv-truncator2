@@ -1,9 +1,9 @@
 //! Video frame extraction and analysis module
 
 use crate::Result;
-use std::path::Path;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Represents a single frame with its timestamp and perceptual hash
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,17 +29,12 @@ pub struct VideoInfo {
     pub bitrate: Option<u64>,
 }
 
-
 /// Get video duration in seconds using GStreamer
 pub fn get_video_duration(video_path: &Path) -> Result<f64> {
     // Use GStreamer for duration extraction
     let config = crate::Config::default();
     crate::gstreamer_extractor::get_video_duration_gstreamer(video_path, &config)
 }
-
-
-
-
 
 /// Get video metadata using GStreamer discoverer
 pub fn get_video_info(video_path: &Path) -> Result<VideoInfo> {
@@ -58,13 +53,13 @@ pub fn generate_perceptual_hash(image: &DynamicImage) -> Result<u64> {
     hash = hash.wrapping_mul(31);
     hash = hash.wrapping_add(rgb_image.height() as u64);
     hash = hash.wrapping_mul(31);
-    
+
     // Add first few pixel values
     let pixels = rgb_image.as_raw();
     for (i, &pixel) in pixels.iter().take(16).enumerate() {
         hash = hash.wrapping_add((pixel as u64) << (i % 8));
     }
-    
+
     Ok(hash)
 }
 
@@ -79,10 +74,10 @@ mod tests {
         // Create a simple test image
         let img = RgbImage::new(100, 100);
         let dynamic_img = DynamicImage::ImageRgb8(img);
-        
+
         let hash1 = generate_perceptual_hash(&dynamic_img).unwrap();
         let hash2 = generate_perceptual_hash(&dynamic_img).unwrap();
-        
+
         // Same image should produce same hash
         assert_eq!(hash1, hash2);
     }
@@ -91,11 +86,10 @@ mod tests {
     fn test_get_video_info_missing_file() {
         let temp_dir = tempdir().unwrap();
         let missing_file = temp_dir.path().join("missing.mkv");
-        
+
         let result = get_video_info(&missing_file);
         assert!(result.is_err());
     }
-
 
     #[test]
     fn test_video_info_parsing() {
@@ -107,10 +101,10 @@ mod tests {
             fps: 23.976,
             bitrate: Some(5000000),
         };
-        
+
         let json = serde_json::to_string(&info).unwrap();
         let parsed: VideoInfo = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(info.duration, parsed.duration);
         assert_eq!(info.width, parsed.width);
         assert_eq!(info.height, parsed.height);

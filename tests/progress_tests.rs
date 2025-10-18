@@ -1,9 +1,6 @@
 //! Tests for progress tracking functionality
 
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::Path;
-use tempfile::TempDir;
-use tvt::analyzer::{extract_frames_with_cache, CacheManager};
 
 #[test]
 fn test_progress_bar_creation() {
@@ -30,34 +27,35 @@ fn test_progress_bar_creation() {
     assert_eq!(pb.position(), 100);
 }
 
-#[test]
-fn test_progress_bar_with_extract_frames() {
-    // Test that progress bar integration works with frame extraction
-    let temp_dir = TempDir::new().unwrap();
-    let cache_manager = CacheManager::new(temp_dir.path().to_path_buf());
-
-    let test_path = Path::new("nonexistent_video.mkv");
-    let sample_rate = 1.0;
-
-    // Create a progress bar
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.blue} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Testing progress...".to_string());
-
-    // Test that extract_frames_with_cache accepts progress bar
-    // This will fail because the video doesn't exist, but it should not panic
-    let result = extract_frames_with_cache(test_path, sample_rate, Some(&pb), Some(&cache_manager));
-    assert!(result.is_err());
-
-    // Verify progress bar was used (it should have been updated)
-    // The exact state depends on when the error occurred, but it should be in a valid state
-    // Since the file doesn't exist, the progress bar might not be updated, so we just check it's valid
-    assert!(pb.position() >= 0);
-}
+// Commented out - old cache functionality no longer exists
+// #[test]
+// fn test_progress_bar_with_extract_frames() {
+//     // Test that progress bar integration works with frame extraction
+//     let temp_dir = TempDir::new().unwrap();
+//     let cache_manager = CacheManager::new(temp_dir.path().to_path_buf());
+//
+//     let test_path = Path::new("nonexistent_video.mkv");
+//     let sample_rate = 1.0;
+//
+//     // Create a progress bar
+//     let pb = ProgressBar::new_spinner();
+//     pb.set_style(
+//         ProgressStyle::default_spinner()
+//             .template("{spinner:.blue} {msg}")
+//             .unwrap(),
+//     );
+//     pb.set_message("Testing progress...".to_string());
+//
+//     // Test that extract_frames_with_cache accepts progress bar
+//     // This will fail because the video doesn't exist, but it should not panic
+//     let result = extract_frames_with_cache(test_path, sample_rate, Some(&pb), Some(&cache_manager));
+//     assert!(result.is_err());
+//
+//     // Verify progress bar was used (it should have been updated)
+//     // The exact state depends on when the error occurred, but it should be in a valid state
+//     // Since the file doesn't exist, the progress bar might not be updated, so we just check it's valid
+//     assert!(pb.position() >= 0);
+// }
 
 #[test]
 fn test_progress_bar_styles() {

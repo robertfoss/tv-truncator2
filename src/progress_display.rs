@@ -9,13 +9,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 /// Spawn a progress display thread that shows all file processors
-pub fn spawn_progress_display(
-    processors: Arc<Mutex<Vec<FileProcessor>>>,
-) -> JoinHandle<()> {
+pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> JoinHandle<()> {
     thread::spawn(move || {
         let multi = MultiProgress::new();
         let mut bars: HashMap<PathBuf, ProgressBar> = HashMap::new();
-        
+
         loop {
             let processors_guard = match processors.try_lock() {
                 Ok(guard) => guard,
@@ -25,32 +23,33 @@ pub fn spawn_progress_display(
                     continue;
                 }
             };
-            
+
             // Create/update progress bars for all files
             for processor in processors_guard.iter() {
                 // Skip Waiting state - no progress bar shown
                 if matches!(processor.state, ProcessingState::Waiting) {
                     continue;
                 }
-                
-                let bar = bars.entry(processor.file_path.clone())
+
+                let bar = bars
+                    .entry(processor.file_path.clone())
                     .or_insert_with(|| create_file_progress_bar(&multi));
-                
+
                 update_progress_bar(bar, processor);
             }
-            
+
             // Check if all complete
             let all_finished = processors_guard.iter().all(|p| p.is_finished());
-            
+
             drop(processors_guard);
-            
+
             if all_finished {
                 break;
             }
-            
+
             thread::sleep(Duration::from_millis(100));
         }
-        
+
         // Clean up progress bars
         multi.clear().unwrap();
     })
@@ -72,7 +71,7 @@ fn create_file_progress_bar(multi: &MultiProgress) -> ProgressBar {
 fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
     let state_info = format_state_info(processor);
     let filename = processor.filename();
-    
+
     // Format message based on state
     let message = match &processor.state {
         ProcessingState::Waiting => {
@@ -85,17 +84,41 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
         ProcessingState::Probed { frames_total } => {
             format!("[{}] {}: {}", frames_total, state_info, filename)
         }
-        ProcessingState::Extracting { frames_processed, frames_total } => {
-            format!("[{}/{}] {}: {}", frames_processed, frames_total, state_info, filename)
+        ProcessingState::Extracting {
+            frames_processed,
+            frames_total,
+        } => {
+            format!(
+                "[{}/{}] {}: {}",
+                frames_processed, frames_total, state_info, filename
+            )
         }
-        ProcessingState::Extracted { frames_processed, frames_total } => {
-            format!("[{}/{}] {}: {}", frames_processed, frames_total, state_info, filename)
+        ProcessingState::Extracted {
+            frames_processed,
+            frames_total,
+        } => {
+            format!(
+                "[{}/{}] {}: {}",
+                frames_processed, frames_total, state_info, filename
+            )
         }
-        ProcessingState::Analyzing { frames_analyzed, frames_total } => {
-            format!("[{}/{}] {}: {}", frames_analyzed, frames_total, state_info, filename)
+        ProcessingState::Analyzing {
+            frames_analyzed,
+            frames_total,
+        } => {
+            format!(
+                "[{}/{}] {}: {}",
+                frames_analyzed, frames_total, state_info, filename
+            )
         }
-        ProcessingState::Analyzed { frames_analyzed, frames_total } => {
-            format!("[{}/{}] {}: {}", frames_analyzed, frames_total, state_info, filename)
+        ProcessingState::Analyzed {
+            frames_analyzed,
+            frames_total,
+        } => {
+            format!(
+                "[{}/{}] {}: {}",
+                frames_analyzed, frames_total, state_info, filename
+            )
         }
         ProcessingState::FindingRepeated { .. } => {
             format!("{}: {}", state_info, filename)
@@ -110,12 +133,12 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
             format!("✗ {}: {} ({})", state_info, filename, error)
         }
     };
-    
+
     // Set progress and length based on state
     let (progress, length) = get_progress_info(processor);
     bar.set_position(progress);
     bar.set_length(length);
-    
+
     // Create progress bar visualization
     let progress_bar = if length > 0 {
         let filled = (progress as f64 / length as f64 * 40.0) as usize;
@@ -125,7 +148,7 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
     } else {
         "[----------------------------------------]".to_string()
     };
-    
+
     // Create the full message with progress bar
     let full_message = format!("{} {}", progress_bar, message);
     bar.set_message(full_message);
@@ -140,22 +163,34 @@ fn get_progress_info(processor: &FileProcessor) -> (u64, u64) {
             (pos, 100)
         }
         ProcessingState::Probed { .. } => (100, 100),
-        ProcessingState::Extracting { frames_processed, frames_total } => {
+        ProcessingState::Extracting {
+            frames_processed,
+            frames_total,
+        } => {
             let total = *frames_total as u64;
             let pos = *frames_processed as u64;
             (pos, total.max(1)) // Avoid division by zero
         }
-        ProcessingState::Extracted { frames_processed, frames_total } => {
+        ProcessingState::Extracted {
+            frames_processed,
+            frames_total,
+        } => {
             let total = *frames_total as u64;
             let pos = *frames_processed as u64;
             (pos, total.max(1))
         }
-        ProcessingState::Analyzing { frames_analyzed, frames_total } => {
+        ProcessingState::Analyzing {
+            frames_analyzed,
+            frames_total,
+        } => {
             let total = *frames_total as u64;
             let pos = *frames_analyzed as u64;
             (pos, total.max(1))
         }
-        ProcessingState::Analyzed { frames_analyzed, frames_total } => {
+        ProcessingState::Analyzed {
+            frames_analyzed,
+            frames_total,
+        } => {
             let total = *frames_total as u64;
             let pos = *frames_analyzed as u64;
             (pos, total.max(1))
@@ -203,12 +238,12 @@ pub fn print_summary(processors: &[FileProcessor]) {
     let total_files = processors.len();
     let completed = processors.iter().filter(|p| p.state.is_done()).count();
     let failed = processors.iter().filter(|p| p.state.is_failed()).count();
-    
+
     println!("\n=== Processing Summary ===");
     println!("Total files: {}", total_files);
     println!("Completed: {}", completed);
     println!("Failed: {}", failed);
-    
+
     if failed > 0 {
         println!("\nFailed files:");
         for processor in processors.iter().filter(|p| p.state.is_failed()) {
@@ -217,7 +252,7 @@ pub fn print_summary(processors: &[FileProcessor]) {
             }
         }
     }
-    
+
     if completed > 0 {
         println!("\nCompleted files:");
         for processor in processors.iter().filter(|p| p.state.is_done()) {
@@ -226,15 +261,17 @@ pub fn print_summary(processors: &[FileProcessor]) {
             }
         }
     }
-    
+
     // Show timing information
-    let total_time = processors.iter()
+    let total_time = processors
+        .iter()
         .map(|p| p.total_elapsed())
         .max()
         .unwrap_or_default();
-    
-    println!("\nTotal processing time: {:02}:{:02}", 
-        total_time.as_secs() / 60, 
+
+    println!(
+        "\nTotal processing time: {:02}:{:02}",
+        total_time.as_secs() / 60,
         total_time.as_secs() % 60
     );
 }
@@ -245,7 +282,7 @@ mod tests {
     use crate::state_machine::{FileProcessor, ProcessingState};
     use std::path::PathBuf;
     use std::time::Duration;
-    
+
     #[test]
     fn test_format_elapsed_time() {
         assert_eq!(_format_elapsed_time(Duration::from_secs(0)), "[00:00]");
@@ -254,61 +291,61 @@ mod tests {
         assert_eq!(_format_elapsed_time(Duration::from_secs(90)), "[01:30]");
         assert_eq!(_format_elapsed_time(Duration::from_secs(3661)), "[61:01]");
     }
-    
+
     #[test]
     fn test_format_state_info() {
         let mut processor = FileProcessor::new(PathBuf::from("test.mkv"));
-        
+
         assert_eq!(format_state_info(&processor), "Waiting");
-        
+
         processor.transition_to(ProcessingState::Probing { progress: 0.5 });
         assert_eq!(format_state_info(&processor), "Probing");
-        
+
         processor.transition_to(ProcessingState::Probed { frames_total: 100 });
         assert_eq!(format_state_info(&processor), "Probed");
-        
-        processor.transition_to(ProcessingState::Extracting { 
-            frames_processed: 5, 
-            frames_total: 20 
+
+        processor.transition_to(ProcessingState::Extracting {
+            frames_processed: 5,
+            frames_total: 20,
         });
         assert_eq!(format_state_info(&processor), "Extracting");
-        
-        processor.transition_to(ProcessingState::Analyzing { 
-            frames_analyzed: 3, 
-            frames_total: 8 
+
+        processor.transition_to(ProcessingState::Analyzing {
+            frames_analyzed: 3,
+            frames_total: 8,
         });
         assert_eq!(format_state_info(&processor), "Analyzing");
-        
+
         processor.transition_to(ProcessingState::Cutting { progress: 0.6 });
         assert_eq!(format_state_info(&processor), "Cutting");
-        
+
         processor.complete(PathBuf::from("output.mkv"));
         assert_eq!(format_state_info(&processor), "Done");
-        
+
         processor.fail("Test error".to_string());
         assert_eq!(format_state_info(&processor), "Failed");
     }
-    
+
     #[test]
     fn test_get_progress_info() {
         let mut processor = FileProcessor::new(PathBuf::from("test.mkv"));
-        
+
         // Test different states
         processor.transition_to(ProcessingState::Probing { progress: 0.5 });
         assert_eq!(get_progress_info(&processor), (50, 100));
-        
+
         processor.transition_to(ProcessingState::Extracting {
             frames_processed: 25,
             frames_total: 100,
         });
         assert_eq!(get_progress_info(&processor), (25, 100));
-        
-        processor.transition_to(ProcessingState::Done { 
-            output_path: PathBuf::from("output.mkv") 
+
+        processor.transition_to(ProcessingState::Done {
+            output_path: PathBuf::from("output.mkv"),
         });
         assert_eq!(get_progress_info(&processor), (100, 100));
     }
-    
+
     #[test]
     fn test_print_summary() {
         let mut processors = vec![
@@ -316,11 +353,11 @@ mod tests {
             FileProcessor::new(PathBuf::from("file2.mkv")),
             FileProcessor::new(PathBuf::from("file3.mkv")),
         ];
-        
+
         processors[0].complete(PathBuf::from("output1.mkv"));
         processors[1].fail("Test error".to_string());
         // processors[2] remains in Waiting state
-        
+
         // This test just ensures the function doesn't panic
         print_summary(&processors);
     }

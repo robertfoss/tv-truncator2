@@ -12,12 +12,14 @@ fn test_gstreamer_initialization() {
 #[test]
 fn test_gstreamer_duration_extraction() {
     // Test with a sample video file
-    let video_path = Path::new("tests/samples/identical_3files/[Yellow-Flash]_Hajime_no_Ippo_-_01.mkv");
-    
+    let video_path =
+        Path::new("tests/samples/identical_3files/[Yellow-Flash]_Hajime_no_Ippo_-_01.mkv");
+
     if video_path.exists() {
-        let result = gstreamer_extractor::get_video_duration_gstreamer(video_path);
+        let config = tvt::Config::default();
+        let result = gstreamer_extractor::get_video_duration_gstreamer(video_path, &config);
         assert!(result.is_ok());
-        
+
         let duration = result.unwrap();
         assert!(duration > 0.0);
         println!("Video duration: {:.2} seconds", duration);
@@ -29,30 +31,33 @@ fn test_gstreamer_duration_extraction() {
 #[test]
 fn test_gstreamer_frame_extraction() {
     // Test with a sample video file
-    let video_path = Path::new("tests/samples/identical_3files/[Yellow-Flash]_Hajime_no_Ippo_-_01.mkv");
-    
+    let video_path =
+        Path::new("tests/samples/identical_3files/[Yellow-Flash]_Hajime_no_Ippo_-_01.mkv");
+
     if video_path.exists() {
+        let config = tvt::Config::default();
         let result = gstreamer_extractor::extract_frames_gstreamer(
             video_path,
             0.5, // 0.5 fps for quick testing
             |current, total| {
                 println!("Progress: {}/{}", current, total);
-            }
+            },
+            &config,
         );
-        
+
         assert!(result.is_ok());
-        
+
         let frames = result.unwrap();
         assert!(!frames.is_empty());
         println!("Extracted {} frames", frames.len());
-        
+
         // Verify frame structure
         for (i, frame) in frames.iter().enumerate() {
             assert!(frame.timestamp >= 0.0);
             assert!(frame.perceptual_hash != 0); // u64 hash should not be zero
-            
+
             if i > 0 {
-                assert!(frame.timestamp > frames[i-1].timestamp);
+                assert!(frame.timestamp > frames[i - 1].timestamp);
             }
         }
     } else {
@@ -63,20 +68,23 @@ fn test_gstreamer_frame_extraction() {
 #[test]
 fn test_gstreamer_metadata_extraction() {
     // Test with a sample video file
-    let video_path = Path::new("tests/samples/identical_3files/[Yellow-Flash]_Hajime_no_Ippo_-_01.mkv");
-    
+    let video_path =
+        Path::new("tests/samples/identical_3files/[Yellow-Flash]_Hajime_no_Ippo_-_01.mkv");
+
     if video_path.exists() {
         let result = gstreamer_extractor::get_video_info_gstreamer(video_path);
         assert!(result.is_ok());
-        
+
         let info = result.unwrap();
         assert!(info.duration > 0.0);
         assert!(info.width > 0);
         assert!(info.height > 0);
         assert!(info.fps > 0.0);
-        
-        println!("Video info: {}x{} @ {:.2}fps, duration: {:.2}s", 
-                 info.width, info.height, info.fps, info.duration);
+
+        println!(
+            "Video info: {}x{} @ {:.2}fps, duration: {:.2}s",
+            info.width, info.height, info.fps, info.duration
+        );
     } else {
         println!("Skipping test - sample video not found");
     }

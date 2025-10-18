@@ -1,12 +1,12 @@
 //! TVT (TV Truncator) - CLI entry point
-//! 
+//!
 //! A command-line tool for removing repetitive segments from TV show episodes.
 
 use clap::Parser;
-use std::path::PathBuf;
 use std::fs;
-use tvt::{Config, Result};
+use std::path::PathBuf;
 use tvt::parallel::process_files_parallel;
+use tvt::{Config, Result};
 
 /// TVT - Remove repetitive segments from TV show episodes
 #[derive(Parser, Debug)]
@@ -63,6 +63,10 @@ struct Args {
     /// Enable debug output for duplicate detection (shows similarity metrics)
     #[arg(long)]
     debug_dupes: bool,
+
+    /// Frame extractor to use (legacy, optimized)
+    #[arg(long, default_value = "legacy")]
+    extractor: String,
 }
 
 fn main() -> Result<()> {
@@ -84,6 +88,9 @@ fn main() -> Result<()> {
         path
     });
 
+    // Parse extractor type
+    let extractor_type = args.extractor.parse::<tvt::ExtractorType>()?;
+
     // Create configuration
     let config = Config {
         input_dir: args.input.clone(),
@@ -93,14 +100,15 @@ fn main() -> Result<()> {
         similarity: args.similarity,
         similarity_threshold: args.similarity_threshold,
         similarity_algorithm: args.algorithm,
+        extractor_type,
         dry_run: args.dry_run,
         quick: args.quick,
         verbose: args.verbose,
         debug: args.debug,
         debug_dupes: args.debug_dupes,
-        parallel_workers: args.parallel.unwrap_or_else(|| {
-            num_cpus::get().saturating_sub(1).max(1)
-        }),
+        parallel_workers: args
+            .parallel
+            .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1)),
     };
 
     if config.verbose {
@@ -113,6 +121,7 @@ fn main() -> Result<()> {
     println!("Threshold: {}", config.threshold);
     println!("Min duration: {}s", config.min_duration);
     println!("Similarity: {}%", config.similarity);
+    println!("Extractor: {}", config.extractor_type);
     println!("Parallel workers: {}", config.parallel_workers);
     println!("Dry run: {}", config.dry_run);
     println!("Debug: {}", config.debug);
@@ -129,11 +138,11 @@ fn main() -> Result<()> {
     // Process files using state machine
     println!("\nStarting parallel processing with state machine...");
     let results = process_files_parallel(video_files, config)?;
-    
+
     // Print summary
     use tvt::progress_display::print_summary;
     print_summary(&results);
-    
+
     // Print segment analysis summary
     print_segment_summary(&results);
 
@@ -143,23 +152,26 @@ fn main() -> Result<()> {
 /// Find all video files in the given directory
 fn find_video_files(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut video_files = Vec::new();
-    
+
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.is_file() {
             if let Some(extension) = path.extension() {
                 if let Some(ext_str) = extension.to_str() {
                     let ext_lower = ext_str.to_lowercase();
-                    if matches!(ext_lower.as_str(), "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm") {
+                    if matches!(
+                        ext_lower.as_str(),
+                        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm"
+                    ) {
                         video_files.push(path);
                     }
                 }
             }
         }
     }
-    
+
     Ok(video_files)
 }
 
@@ -172,45 +184,51 @@ fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor]) {
             all_segments.extend(segments.clone());
         }
     }
-    
+
     if all_segments.is_empty() {
         println!("\n=== Segment Analysis Summary ===");
         println!("No identical segments found that meet the threshold criteria.");
         return;
     }
-    
+
     // Remove duplicates (same segments might be stored in multiple processors)
     all_segments.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
     all_segments.dedup_by(|a, b| {
-        (a.start_time - b.start_time).abs() < 0.1 && 
-        (a.end_time - b.end_time).abs() < 0.1
+        (a.start_time - b.start_time).abs() < 0.1 && (a.end_time - b.end_time).abs() < 0.1
     });
-    
+
     println!("\n=== Segment Analysis Summary ===");
-    println!("Found {} identical segment(s) across {} file(s):", all_segments.len(), processors.len());
+    println!(
+        "Found {} identical segment(s) across {} file(s):",
+        all_segments.len(),
+        processors.len()
+    );
     println!();
-    
+
     for (i, segment) in all_segments.iter().enumerate() {
         let duration = segment.end_time - segment.start_time;
         let confidence_percent = (segment.confidence * 100.0) as u8;
-        
+
         println!("Segment {}:", i + 1);
-        println!("  Time: {:.2}s - {:.2}s (duration: {:.2}s)", 
-                 segment.start_time, segment.end_time, duration);
+        println!(
+            "  Time: {:.2}s - {:.2}s (duration: {:.2}s)",
+            segment.start_time, segment.end_time, duration
+        );
         println!("  Confidence: {}%", confidence_percent);
         println!("  Found in {} episode(s):", segment.episode_list.len());
-        
+
         for episode_name in &segment.episode_list {
             println!("    - {}", episode_name);
         }
         println!();
     }
-    
+
     // Calculate total time saved
-    let total_duration: f64 = all_segments.iter()
-        .map(|s| s.end_time - s.start_time)
-        .sum();
-    
-    println!("Total time that will be removed: {:.2} seconds ({:.2} minutes)", 
-             total_duration, total_duration / 60.0);
+    let total_duration: f64 = all_segments.iter().map(|s| s.end_time - s.start_time).sum();
+
+    println!(
+        "Total time that will be removed: {:.2} seconds ({:.2} minutes)",
+        total_duration,
+        total_duration / 60.0
+    );
 }

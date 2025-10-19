@@ -31,15 +31,15 @@ pub struct VideoInfo {
 
 /// Get video duration in seconds using GStreamer
 pub fn get_video_duration(video_path: &Path) -> Result<f64> {
-    // Use GStreamer for duration extraction
+    // Use GStreamer V2 for duration extraction
     let config = crate::Config::default();
-    crate::gstreamer_extractor::get_video_duration_gstreamer(video_path, &config)
+    crate::gstreamer_extractor_v2::get_video_duration_gstreamer(video_path, &config)
 }
 
 /// Get video metadata using GStreamer discoverer
 pub fn get_video_info(video_path: &Path) -> Result<VideoInfo> {
-    // Use GStreamer for metadata extraction
-    crate::gstreamer_extractor::get_video_info_gstreamer(video_path)
+    // Use GStreamer V2 for metadata extraction
+    crate::gstreamer_extractor_v2::get_video_info_gstreamer(video_path)
 }
 
 /// Generate perceptual hash for an image

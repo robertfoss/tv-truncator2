@@ -129,8 +129,8 @@ fn create_cutting_pipeline(input_path: &str, output_path: &str) -> Result<gst::P
 
     let x264enc = gst::ElementFactory::make("x264enc")
         .name("x264enc")
-        .property("tune", "zerolatency")
-        .property("speed-preset", "ultrafast")
+        .property_from_str("tune", "zerolatency")
+        .property_from_str("speed-preset", "ultrafast")
         .build()?;
 
     let matroskamux = gst::ElementFactory::make("matroskamux")

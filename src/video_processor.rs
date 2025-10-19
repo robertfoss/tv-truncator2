@@ -1,6 +1,5 @@
 //! Video processing and cutting operations
 
-use crate::gstreamer_cutter;
 use crate::Result;
 use anyhow::Context;
 use std::fs;
@@ -97,14 +96,125 @@ fn build_segments_to_keep(segments_to_remove: &[(f64, f64)], duration: f64) -> V
     segments_to_keep
 }
 
-/// Cut video using GStreamer
+/// Cut video using ffmpeg (more reliable than GStreamer for cutting)
 fn cut_video_with_segments(
     input_path: &Path,
     output_path: &Path,
     segments_to_keep: &[(f64, f64)],
 ) -> Result<()> {
-    // Use GStreamer for video cutting
-    gstreamer_cutter::cut_video_segments_gstreamer(input_path, output_path, segments_to_keep)
+    // For multiple segments, we need to extract each segment and concatenate them
+    // For now, implement single segment cutting (most common case)
+    
+    if segments_to_keep.len() == 1 {
+        // Simple case: one continuous segment
+        let (start, end) = segments_to_keep[0];
+        let duration = end - start;
+        
+        // Use ffmpeg to cut the segment
+        let status = Command::new("ffmpeg")
+            .arg("-y") // Overwrite output
+            .arg("-ss")
+            .arg(format!("{:.3}", start))
+            .arg("-t")
+            .arg(format!("{:.3}", duration))
+            .arg("-i")
+            .arg(input_path)
+            .arg("-c")
+            .arg("copy") // Stream copy (no re-encoding)
+            .arg(output_path)
+            .output()
+            .with_context(|| "Failed to execute ffmpeg")?;
+        
+        if !status.status.success() {
+            anyhow::bail!(
+                "ffmpeg failed: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+        
+        Ok(())
+    } else {
+        // Multiple segments - need to concatenate
+        cut_and_concatenate_segments(input_path, output_path, segments_to_keep)
+    }
+}
+
+/// Cut and concatenate multiple segments
+fn cut_and_concatenate_segments(
+    input_path: &Path,
+    output_path: &Path,
+    segments_to_keep: &[(f64, f64)],
+) -> Result<()> {
+    use std::io::Write;
+    
+    // Create temporary directory for segment files
+    let temp_dir_path = std::env::temp_dir().join(format!("tvt_cutting_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir_path)?;
+    let mut segment_files = Vec::new();
+    
+    // Extract each segment
+    for (i, (start, end)) in segments_to_keep.iter().enumerate() {
+        let duration = end - start;
+        let segment_path = temp_dir_path.join(format!("segment_{:03}.mkv", i));
+        
+        let status = Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-ss")
+            .arg(format!("{:.3}", start))
+            .arg("-t")
+            .arg(format!("{:.3}", duration))
+            .arg("-i")
+            .arg(input_path)
+            .arg("-c")
+            .arg("copy")
+            .arg(&segment_path)
+            .output()
+            .with_context(|| "Failed to execute ffmpeg")?;
+        
+        if !status.status.success() {
+            anyhow::bail!(
+                "ffmpeg failed to extract segment: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
+        
+        segment_files.push(segment_path);
+    }
+    
+    // Create concat file list
+    let concat_file = temp_dir_path.join("concat.txt");
+    let mut file = fs::File::create(&concat_file)?;
+    for segment_path in &segment_files {
+        writeln!(file, "file '{}'", segment_path.display())?;
+    }
+    drop(file);
+    
+    // Concatenate segments
+    let status = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&concat_file)
+        .arg("-c")
+        .arg("copy")
+        .arg(output_path)
+        .output()
+        .with_context(|| "Failed to execute ffmpeg for concatenation")?;
+    
+    if !status.status.success() {
+        anyhow::bail!(
+            "ffmpeg concatenation failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    
+    // Clean up temporary directory
+    let _ = fs::remove_dir_all(&temp_dir_path);
+    
+    Ok(())
 }
 
 /// Create an empty video file using GStreamer

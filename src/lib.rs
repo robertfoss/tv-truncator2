@@ -8,8 +8,6 @@
 
 pub mod analyzer;
 pub mod gstreamer_cutter;
-pub mod gstreamer_extractor;
-pub mod gstreamer_extractor_optimized;
 pub mod gstreamer_extractor_v2;
 pub mod hasher;
 pub mod parallel;
@@ -23,39 +21,6 @@ pub mod video_processor;
 /// Common error types used throughout the application
 pub type Result<T> = anyhow::Result<T>;
 
-/// Frame extractor implementation to use
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractorType {
-    /// Legacy extractor (current implementation)
-    Legacy,
-    /// Optimized extractor with seek-based extraction
-    Optimized,
-}
-
-impl std::str::FromStr for ExtractorType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "legacy" => Ok(ExtractorType::Legacy),
-            "optimized" => Ok(ExtractorType::Optimized),
-            _ => Err(anyhow::anyhow!(
-                "Unknown extractor type: {}. Valid options: legacy, optimized",
-                s
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for ExtractorType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExtractorType::Legacy => write!(f, "legacy"),
-            ExtractorType::Optimized => write!(f, "optimized"),
-        }
-    }
-}
-
 /// Configuration for the TVT application
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -66,7 +31,6 @@ pub struct Config {
     pub similarity: u8,
     pub similarity_threshold: f64, // Make configurable (was hardcoded 0.9)
     pub similarity_algorithm: crate::similarity::SimilarityAlgorithm,
-    pub extractor_type: ExtractorType,
     pub dry_run: bool,
     pub quick: bool,
     pub verbose: bool,
@@ -85,7 +49,6 @@ impl Default for Config {
             similarity: 90,
             similarity_threshold: 0.75, // Default 75% similarity
             similarity_algorithm: crate::similarity::SimilarityAlgorithm::Current,
-            extractor_type: ExtractorType::Legacy, // Default to legacy for backward compatibility
             dry_run: false,
             quick: false,
             verbose: false,

@@ -1,8 +1,7 @@
 //! Parallel processing orchestration with state machine and synchronization points
 
 use crate::analyzer::{get_video_info, EpisodeFrames, VideoInfo};
-use crate::gstreamer_extractor::{extract_frames_gstreamer, get_video_duration_gstreamer};
-use crate::gstreamer_extractor_v2::extract_frames_gstreamer_v2;
+use crate::gstreamer_extractor_v2::{extract_frames_gstreamer_v2, get_video_duration_gstreamer};
 use crate::progress_display::spawn_progress_display;
 use crate::segment_detector::{detect_common_segments, merge_overlapping_segments};
 use crate::state_machine::{FileProcessor, ProcessingState};
@@ -282,49 +281,26 @@ fn extract_frames_with_state_machine_progress(
     let processors_arc_clone = processors_arc.clone();
     let video_path_for_callback = video_path_clone.clone();
 
-    // Extract frames using selected extractor with progress callback
-    let frames = match config.extractor_type {
-        crate::ExtractorType::Legacy => {
-            extract_frames_gstreamer(
-                &video_path_clone,
-                sample_rate,
-                move |current, total| {
-                    // Update the state machine with current progress
-                    if let Err(e) = update_processor_state(
-                        &processors_arc_clone,
-                        &video_path_for_callback,
-                        |p| {
-                            p.update_extracting(current, total);
-                        },
-                    ) {
-                        eprintln!("Failed to update processor state: {}", e);
-                    }
+    // Extract frames using optimized V2 extractor with progress callback
+    // This extractor automatically uses hardware acceleration (VA-API) if available,
+    // and falls back to software decoding if hardware fails
+    let frames = extract_frames_gstreamer_v2(
+        &video_path,
+        sample_rate,
+        move |current, total| {
+            // Update the state machine with current progress
+            if let Err(e) = update_processor_state(
+                &processors_arc_clone,
+                &video_path_for_callback,
+                |p| {
+                    p.update_extracting(current, total);
                 },
-                config,
-            )?
-        }
-        crate::ExtractorType::Optimized => {
-            let processors_arc_clone_v2 = processors_arc.clone();
-            let video_path_for_callback_v2 = video_path.clone();
-            extract_frames_gstreamer_v2(
-                &video_path,
-                sample_rate,
-                move |current, total| {
-                    // Update the state machine with current progress
-                    if let Err(e) = update_processor_state(
-                        &processors_arc_clone_v2,
-                        &video_path_for_callback_v2,
-                        |p| {
-                            p.update_extracting(current, total);
-                        },
-                    ) {
-                        eprintln!("Failed to update processor state: {}", e);
-                    }
-                },
-                config,
-            )?
-        }
-    };
+            ) {
+                eprintln!("Failed to update processor state: {}", e);
+            }
+        },
+        config,
+    )?;
 
     let total_extraction_time = extraction_start.elapsed();
 

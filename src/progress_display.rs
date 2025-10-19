@@ -13,6 +13,7 @@ pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> Joi
     thread::spawn(move || {
         let multi = MultiProgress::new();
         let mut bars: HashMap<PathBuf, ProgressBar> = HashMap::new();
+        let mut bar_order: Vec<PathBuf> = Vec::new();
 
         loop {
             let processors_guard = match processors.try_lock() {
@@ -24,19 +25,54 @@ pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> Joi
                 }
             };
 
-            // Create/update progress bars for all files
-            for processor in processors_guard.iter() {
+            // Clone the data we need to avoid holding the lock too long
+            let mut processor_data: Vec<(PathBuf, String, ProcessingState)> = processors_guard
+                .iter()
+                .map(|p| (p.file_path.clone(), p.filename(), p.state.clone()))
+                .collect();
+            
+            // Sort by filename (alphabetically)
+            processor_data.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            
+            // Release the lock before updating progress bars
+            drop(processors_guard);
+
+            // Create/update progress bars for all files in alphabetical order
+            for (file_path, filename, state) in processor_data.iter() {
                 // Skip Waiting state - no progress bar shown
-                if matches!(processor.state, ProcessingState::Waiting) {
+                if matches!(state, ProcessingState::Waiting) {
                     continue;
                 }
 
-                let bar = bars
-                    .entry(processor.file_path.clone())
-                    .or_insert_with(|| create_file_progress_bar(&multi));
+                // Create bar only once and maintain order
+                if !bars.contains_key(file_path) {
+                    let bar = create_file_progress_bar(&multi);
+                    bars.insert(file_path.clone(), bar);
+                    bar_order.push(file_path.clone());
+                }
 
-                update_progress_bar(bar, processor);
+                // Update the bar
+                if let Some(bar) = bars.get(file_path) {
+                    // Reconstruct minimal processor info for display
+                    let state_info = format_state_info_from_state(state);
+                    let message = format!("{}: {}", state_info, filename);
+                    bar.set_message(message);
+                    
+                    // Update progress position based on state
+                    let (progress, length) = get_progress_info_from_state(state);
+                    bar.set_position(progress);
+                    bar.set_length(length);
+                }
             }
+            
+            // Re-acquire lock to check completion
+            let processors_guard = match processors.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
 
             // Check if all complete
             let all_finished = processors_guard.iter().all(|p| p.is_finished());
@@ -44,14 +80,20 @@ pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> Joi
             drop(processors_guard);
 
             if all_finished {
+                // Mark all bars as finished but don't clear them immediately
+                for bar in bars.values() {
+                    bar.finish();
+                }
+                // Give a moment for the bars to be visible
+                thread::sleep(Duration::from_millis(500));
                 break;
             }
 
             thread::sleep(Duration::from_millis(100));
         }
 
-        // Clean up progress bars
-        multi.clear().unwrap();
+        // Don't clear progress bars - let them stay visible
+        // The MultiProgress will clean up when dropped
     })
 }
 
@@ -60,14 +102,15 @@ fn create_file_progress_bar(multi: &MultiProgress) -> ProgressBar {
     let pb = multi.add(ProgressBar::new(100));
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{msg}")
+            .template("{bar:40} {msg}")
             .unwrap()
-            .progress_chars("#>-"),
+            .progress_chars("█▓▒░"),
     );
     pb
 }
 
 /// Update a progress bar based on file processor state
+#[allow(dead_code)]
 fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
     let state_info = format_state_info(processor);
     let filename = processor.filename();
@@ -154,7 +197,59 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
     bar.set_message(full_message);
 }
 
+/// Get progress information from just the state
+fn get_progress_info_from_state(state: &ProcessingState) -> (u64, u64) {
+    match state {
+        ProcessingState::Waiting => (0, 100),
+        ProcessingState::Probing { progress } => {
+            let pos = (progress * 100.0) as u64;
+            (pos, 100)
+        }
+        ProcessingState::Probed { .. } => (100, 100),
+        ProcessingState::Extracting {
+            frames_processed,
+            frames_total,
+        } => {
+            let total = *frames_total as u64;
+            let pos = *frames_processed as u64;
+            (pos, total.max(1))
+        }
+        ProcessingState::Extracted {
+            frames_processed,
+            frames_total,
+        } => {
+            let total = *frames_total as u64;
+            let pos = *frames_processed as u64;
+            (pos, total.max(1))
+        }
+        ProcessingState::Analyzing {
+            frames_analyzed,
+            frames_total,
+        } => {
+            let total = *frames_total as u64;
+            let pos = *frames_analyzed as u64;
+            (pos, total.max(1))
+        }
+        ProcessingState::Analyzed {
+            frames_analyzed,
+            frames_total,
+        } => {
+            let total = *frames_total as u64;
+            let pos = *frames_analyzed as u64;
+            (pos, total.max(1))
+        }
+        ProcessingState::FindingRepeated { .. } => (50, 100),
+        ProcessingState::Cutting { progress } => {
+            let pos = (progress * 100.0) as u64;
+            (pos, 100)
+        }
+        ProcessingState::Done { .. } => (100, 100),
+        ProcessingState::Failed { .. } => (0, 100),
+    }
+}
+
 /// Get progress information for a state
+#[allow(dead_code)]
 fn get_progress_info(processor: &FileProcessor) -> (u64, u64) {
     match &processor.state {
         ProcessingState::Waiting => (0, 100),
@@ -216,7 +311,31 @@ fn _format_elapsed_time(duration: Duration) -> String {
     format!("[{:02}:{:02}]", minutes, seconds)
 }
 
+/// Format state information from just the state (for simplified display)
+fn format_state_info_from_state(state: &ProcessingState) -> String {
+    match state {
+        ProcessingState::Waiting => "Waiting".to_string(),
+        ProcessingState::Probing { progress } => format!("Probing ({:.0}%)", progress * 100.0),
+        ProcessingState::Probed { .. } => "Probed".to_string(),
+        ProcessingState::Extracting {
+            frames_processed,
+            frames_total,
+        } => format!("Extracting {}/{}", frames_processed, frames_total),
+        ProcessingState::Extracted { .. } => "Extracted".to_string(),
+        ProcessingState::Analyzing {
+            frames_analyzed,
+            frames_total,
+        } => format!("Analyzing {}/{}", frames_analyzed, frames_total),
+        ProcessingState::Analyzed { .. } => "Analyzed".to_string(),
+        ProcessingState::FindingRepeated { .. } => "Finding Duplicates".to_string(),
+        ProcessingState::Cutting { progress } => format!("Cutting ({:.0}%)", progress * 100.0),
+        ProcessingState::Done { .. } => "Done".to_string(),
+        ProcessingState::Failed { error } => format!("Failed: {}", error),
+    }
+}
+
 /// Format state information for display
+#[allow(dead_code)]
 fn format_state_info(processor: &FileProcessor) -> String {
     match &processor.state {
         ProcessingState::Waiting => "Waiting".to_string(),

@@ -63,10 +63,6 @@ struct Args {
     /// Enable debug output for duplicate detection (shows similarity metrics)
     #[arg(long)]
     debug_dupes: bool,
-
-    /// Frame extractor to use (legacy, optimized)
-    #[arg(long, default_value = "legacy")]
-    extractor: String,
 }
 
 fn main() -> Result<()> {
@@ -88,9 +84,6 @@ fn main() -> Result<()> {
         path
     });
 
-    // Parse extractor type
-    let extractor_type = args.extractor.parse::<tvt::ExtractorType>()?;
-
     // Create configuration
     let config = Config {
         input_dir: args.input.clone(),
@@ -100,7 +93,6 @@ fn main() -> Result<()> {
         similarity: args.similarity,
         similarity_threshold: args.similarity_threshold,
         similarity_algorithm: args.algorithm,
-        extractor_type,
         dry_run: args.dry_run,
         quick: args.quick,
         verbose: args.verbose,
@@ -121,7 +113,15 @@ fn main() -> Result<()> {
     println!("Threshold: {}", config.threshold);
     println!("Min duration: {}s", config.min_duration);
     println!("Similarity: {}%", config.similarity);
-    println!("Extractor: {}", config.extractor_type);
+    
+    // Check and display hardware acceleration status
+    let (hw_available, hw_description) = tvt::gstreamer_extractor_v2::check_hardware_acceleration();
+    if hw_available {
+        println!("Hardware acceleration: {} (enabled)", hw_description);
+    } else {
+        println!("Hardware acceleration: {} (will use CPU)", hw_description);
+    }
+    
     println!("Parallel workers: {}", config.parallel_workers);
     println!("Dry run: {}", config.dry_run);
     println!("Debug: {}", config.debug);

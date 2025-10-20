@@ -34,10 +34,14 @@ gstreamer = { version = "0.22", optional = true }
 gstreamer-app = { version = "0.22", optional = true }
 gstreamer-video = { version = "0.22", optional = true }
 gstreamer-pbutils = { version = "0.22", optional = true }
+gstreamer-audio = { version = "0.22", optional = true }
+rustfft = "6.2"
+realfft = "3.3"
+apodize = "1.0"
 
 [features]
 default = ["gstreamer"]
-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-pbutils"]
+gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:gstreamer-pbutils", "dep:gstreamer-audio"]
 ffmpeg = []  # Keep old code path as fallback
 
 [dev-dependencies]

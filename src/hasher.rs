@@ -32,10 +32,13 @@ impl RollingHash {
 
             // Return hash only when window is full
             if self.position == self.window_size {
-                // Calculate initial hash
+                // Calculate initial hash using wrapping arithmetic
                 self.current_hash = 0;
                 for &val in &self.window {
-                    self.current_hash = (self.current_hash * self.prime + val) % self.modulus;
+                    self.current_hash = self.current_hash
+                        .wrapping_mul(self.prime)
+                        .wrapping_add(val)
+                        % self.modulus;
                 }
                 Some(self.current_hash)
             } else {
@@ -54,9 +57,15 @@ impl RollingHash {
             // Add new value at the end
             self.window[self.window_size - 1] = value;
 
-            // Update hash: remove old value, add new value
-            self.current_hash = (self.current_hash + self.modulus - old_value) % self.modulus;
-            self.current_hash = (self.current_hash * self.prime + value) % self.modulus;
+            // Update hash by recalculating from current window
+            // Use wrapping arithmetic to avoid overflow
+            self.current_hash = 0;
+            for &val in &self.window {
+                self.current_hash = self.current_hash
+                    .wrapping_mul(self.prime)
+                    .wrapping_add(val)
+                    % self.modulus;
+            }
 
             Some(self.current_hash)
         }

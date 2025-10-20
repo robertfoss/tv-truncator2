@@ -5,6 +5,7 @@ A high-performance Rust tool for removing repetitive segments from TV show episo
 ## Features
 
 - **Smart Video Analysis**: Uses perceptual hashing and rolling hash algorithms to detect identical segments
+- **Audio Matching**: Spectral hash-based audio detection (always enabled) for identifying audio-only duplicates (intros/outros with matching audio but different video)
 - **High Performance**: GStreamer-based in-memory processing eliminates disk I/O bottlenecks
 - **Parallel Processing**: Multi-threaded analysis with configurable worker count
 - **Multiple Algorithms**: Current, MultiHash, and SSIM+Features similarity detection
@@ -72,10 +73,10 @@ cargo build --release --no-default-features --features ffmpeg
 ### Basic Usage
 
 ```bash
-# Process a TV show directory
+# Process a TV show directory (audio+video matching enabled by default)
 ./target/release/tvt --input /path/to/tv/show --threshold 3 --min-duration 10.0
 
-# Quick mode for testing (0.5fps sampling)
+# Quick mode for testing (0.5fps sampling for both video and audio)
 ./target/release/tvt --input /path/to/tv/show --quick --threshold 2
 
 # Dry run to see what would be removed
@@ -94,6 +95,12 @@ cargo build --release --no-default-features --features ffmpeg
   --algorithm ssim \
   --parallel 4
 
+# Audio-only mode (skip video analysis, faster)
+./target/release/tvt \
+  --input /path/to/tv/show \
+  --audio-only \
+  --threshold 3
+
 # Debug mode with detailed output
 ./target/release/tvt \
   --input /path/to/tv/show \
@@ -109,13 +116,15 @@ cargo build --release --no-default-features --features ffmpeg
 - `--threshold <N>`: Minimum episodes containing segment to remove (default: 3)
 - `--min-duration <SEC>`: Minimum segment duration to remove (default: 10.0)
 - `--similarity <PERCENT>`: Similarity threshold percentage (default: 90)
-- `--algorithm <ALGO>`: Detection algorithm (current, multihash, ssim)
+- `--algorithm <ALGO>`: Video detection algorithm (current, multihash, ssim)
+- `--audio-algorithm <ALGO>`: Audio detection algorithm (spectral-hash, cross-correlation) - default: cross-correlation
 - `--parallel <N>`: Number of parallel workers (default: CPU count)
 - `--quick`: Use 0.5fps sampling for faster processing
 - `--dry-run`: Show what would be removed without processing
 - `--debug`: Enable debug output
 - `--debug-dupes`: Show detailed duplicate detection info
 - `--verbose`: Show detailed progress information
+- `--audio-only`: Only detect audio segments (skip video analysis for faster processing)
 
 ## Performance
 
@@ -152,6 +161,32 @@ On a typical TV episode (45 minutes, 1080p):
 1. **Current**: Rolling hash with configurable window size
 2. **MultiHash**: Multiple perceptual hash comparison
 3. **SSIM+Features**: Structural similarity with feature matching
+
+### Audio Matching
+
+TVT includes built-in audio-based duplicate detection using spectral hashing (always enabled):
+
+- **Spectral Hash**: FFT-based perceptual audio fingerprinting
+- **Rolling Hash**: Same rolling window technique as video matching
+- **Match Types**:
+  - **video**: Only video content matches
+  - **audio**: Only audio content matches (e.g., same music/dialogue, different visuals)
+  - **audio+video**: Both audio and video match (traditional duplicates)
+
+**Use Cases:**
+- Detect intros/outros with identical theme music but different opening animations
+- Find segments where audio dialogue is reused with different video cuts
+- Identify credit sequences with same music but different visual styles
+
+**Technical Details:**
+- Audio extracted at 22.05kHz mono using GStreamer
+- Two algorithms available:
+  1. **Spectral Hash** (fast, exact matching): FFT-based perceptual hashing
+  2. **Cross-Correlation** (robust, default): Handles encoding differences and phase shifts
+- FFT window size: 8192 samples with 75% overlap
+- Spectral features: centroid, rolloff, dominant frequency bins, energy
+- Combines with video detection for comprehensive matching
+- Outputs show both video and audio confidence separately
 
 ## Development
 

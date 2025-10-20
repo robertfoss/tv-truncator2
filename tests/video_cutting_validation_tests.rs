@@ -51,12 +51,15 @@ fn test_cutting_removes_correct_duration_downscaled_2file() -> Result<()> {
         similarity: 90,
         similarity_threshold: 0.75,
         similarity_algorithm: tvt::similarity::SimilarityAlgorithm::Current,
+        audio_algorithm: tvt::AudioAlgorithm::CrossCorrelation,
         dry_run: false, // Actually cut the videos
         quick: false,
         verbose: false,
         debug: false,
         debug_dupes: false,
         parallel_workers: 1,
+        enable_audio_matching: false, // Video only for this test
+        audio_only: false,
     };
     
     // Find video files (should be 2: episodes 01 and 02)
@@ -160,6 +163,8 @@ fn test_truncated_files_are_valid_videos() -> Result<()> {
         debug: false,
         debug_dupes: false,
         parallel_workers: 1,
+        enable_audio_matching: false,
+        audio_only: false,
     };
     
     let mut video_files: Vec<PathBuf> = fs::read_dir(&input_dir)?
@@ -223,6 +228,8 @@ fn test_single_segment_cutting() -> Result<()> {
         debug: false,
         debug_dupes: false,
         parallel_workers: 1,
+        enable_audio_matching: false,
+        audio_only: false,
     };
     
     let mut video_files: Vec<PathBuf> = fs::read_dir(&input_dir)?

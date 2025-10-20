@@ -77,12 +77,15 @@ fn run_detection(
         similarity: 90,
         similarity_threshold: test_config.similarity_threshold,
         similarity_algorithm: algorithm,
+        audio_algorithm: tvt::AudioAlgorithm::CrossCorrelation,
         dry_run: true, // Don't actually create output files
         quick: false,
         verbose: false,
         debug: false,
         debug_dupes: false,
         parallel_workers: test_config.parallel_workers,
+        enable_audio_matching: false, // Regression test - video only
+        audio_only: false,
     };
 
     // Get video files from test directory

@@ -16,16 +16,28 @@ pub enum ProcessingState {
     /// Video metadata obtained, ready to extract frames
     Probed { frames_total: usize },
 
-    /// Extracting frames from video
-    Extracting {
+    /// Extracting video frames
+    ExtractingVideo {
         frames_processed: usize,
         frames_total: usize,
     },
 
-    /// Frame extraction complete
-    Extracted {
+    /// Video frame extraction complete
+    ExtractedVideo {
         frames_processed: usize,
         frames_total: usize,
+    },
+
+    /// Extracting audio samples
+    ExtractingAudio {
+        samples_processed: usize,
+        samples_total: usize,
+    },
+
+    /// Audio extraction complete
+    ExtractedAudio {
+        samples_processed: usize,
+        samples_total: usize,
     },
 
     /// Analyzing extracted frames for patterns
@@ -77,8 +89,10 @@ impl ProcessingState {
         matches!(
             self,
             ProcessingState::Probed { .. }
-                | ProcessingState::Extracting { .. }
-                | ProcessingState::Extracted { .. }
+                | ProcessingState::ExtractingVideo { .. }
+                | ProcessingState::ExtractedVideo { .. }
+                | ProcessingState::ExtractingAudio { .. }
+                | ProcessingState::ExtractedAudio { .. }
                 | ProcessingState::Analyzing { .. }
                 | ProcessingState::Analyzed { .. }
                 | ProcessingState::FindingRepeated { .. }
@@ -104,7 +118,7 @@ impl ProcessingState {
             ProcessingState::Waiting => 0.0,
             ProcessingState::Probing { progress } => *progress,
             ProcessingState::Probed { .. } => 1.0,
-            ProcessingState::Extracting {
+            ProcessingState::ExtractingVideo {
                 frames_processed,
                 frames_total,
             } => {
@@ -114,7 +128,18 @@ impl ProcessingState {
                     *frames_processed as f64 / *frames_total as f64
                 }
             }
-            ProcessingState::Extracted { .. } => 1.0,
+            ProcessingState::ExtractedVideo { .. } => 1.0,
+            ProcessingState::ExtractingAudio {
+                samples_processed,
+                samples_total,
+            } => {
+                if *samples_total == 0 {
+                    0.0
+                } else {
+                    *samples_processed as f64 / *samples_total as f64
+                }
+            }
+            ProcessingState::ExtractedAudio { .. } => 1.0,
             ProcessingState::Analyzing {
                 frames_analyzed,
                 frames_total,
@@ -139,8 +164,10 @@ impl ProcessingState {
             ProcessingState::Waiting => "Waiting",
             ProcessingState::Probing { .. } => "Probing",
             ProcessingState::Probed { .. } => "Probed",
-            ProcessingState::Extracting { .. } => "Extracting",
-            ProcessingState::Extracted { .. } => "Extracted",
+            ProcessingState::ExtractingVideo { .. } => "Extracting Video",
+            ProcessingState::ExtractedVideo { .. } => "Video Extracted",
+            ProcessingState::ExtractingAudio { .. } => "Extracting Audio",
+            ProcessingState::ExtractedAudio { .. } => "Audio Extracted",
             ProcessingState::Analyzing { .. } => "Analyzing",
             ProcessingState::Analyzed { .. } => "Analyzed",
             ProcessingState::FindingRepeated { .. } => "Finding Repeated",
@@ -165,6 +192,9 @@ pub struct FileProcessor {
 
     /// Extracted frames (populated after extraction)
     pub frames: Option<EpisodeFrames>,
+
+    /// Extracted audio frames (populated after audio extraction)
+    pub audio_frames: Option<crate::audio_extractor::EpisodeAudio>,
 
     /// Analysis results as rolling hashes
     pub analysis_results: Option<Vec<u64>>,
@@ -194,6 +224,7 @@ impl FileProcessor {
             state: ProcessingState::Waiting,
             video_info: None,
             frames: None,
+            audio_frames: None,
             analysis_results: None,
             duplicates: None,
             common_segments: None,
@@ -278,12 +309,22 @@ impl FileProcessor {
         }
     }
 
-    /// Update extraction progress
-    pub fn update_extracting(&mut self, frames_processed: usize, frames_total: usize) {
-        if let ProcessingState::Extracting { .. } = self.state {
-            self.state = ProcessingState::Extracting {
+    /// Update video extraction progress
+    pub fn update_extracting_video(&mut self, frames_processed: usize, frames_total: usize) {
+        if let ProcessingState::ExtractingVideo { .. } = self.state {
+            self.state = ProcessingState::ExtractingVideo {
                 frames_processed,
                 frames_total,
+            };
+        }
+    }
+
+    /// Update audio extraction progress
+    pub fn update_extracting_audio(&mut self, samples_processed: usize, samples_total: usize) {
+        if let ProcessingState::ExtractingAudio { .. } = self.state {
+            self.state = ProcessingState::ExtractingAudio {
+                samples_processed,
+                samples_total,
             };
         }
     }
@@ -341,7 +382,7 @@ mod tests {
         processor.transition_to(ProcessingState::Probed { frames_total: 100 });
         assert!(processor.state.reached_first_sync());
 
-        processor.transition_to(ProcessingState::Extracting {
+        processor.transition_to(ProcessingState::ExtractingVideo {
             frames_processed: 50,
             frames_total: 100,
         });

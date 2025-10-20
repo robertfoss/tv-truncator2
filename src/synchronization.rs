@@ -295,7 +295,7 @@ mod tests {
             let mut guard = processors.lock().unwrap();
             guard[0].transition_to(ProcessingState::Probing { progress: 0.5 });
             guard[1].transition_to(ProcessingState::Probed { frames_total: 100 });
-            guard[2].transition_to(ProcessingState::Extracting {
+            guard[2].transition_to(ProcessingState::ExtractingVideo {
                 frames_processed: 25,
                 frames_total: 100,
             });
@@ -308,6 +308,6 @@ mod tests {
         let state_names: Vec<&str> = status.iter().map(|(_, state, _)| state.as_str()).collect();
         assert!(state_names.contains(&"Probing"));
         assert!(state_names.contains(&"Probed"));
-        assert!(state_names.contains(&"Extracting"));
+        assert!(state_names.contains(&"Extracting Video"));
     }
 }

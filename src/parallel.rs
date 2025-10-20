@@ -1,9 +1,15 @@
 //! Parallel processing orchestration with state machine and synchronization points
 
 use crate::analyzer::{get_video_info, EpisodeFrames, VideoInfo};
+use crate::audio_extractor::{extract_audio_samples, EpisodeAudio};
+use crate::audio_hasher::process_audio_samples;
 use crate::gstreamer_extractor_v2::{extract_frames_gstreamer_v2, get_video_duration_gstreamer};
 use crate::progress_display::spawn_progress_display;
-use crate::segment_detector::{detect_common_segments, merge_overlapping_segments};
+use crate::audio_correlation::detect_audio_segments_correlation;
+use crate::segment_detector::{
+    combine_audio_video_segments, detect_audio_segments, detect_common_segments,
+    merge_overlapping_segments,
+};
 use crate::state_machine::{FileProcessor, ProcessingState};
 use crate::synchronization::{ProcessingCoordinator, SyncPoint};
 use crate::video_processor::cut_video_segments;
@@ -68,16 +74,24 @@ fn process_pipeline(
     // SYNC POINT 1: Wait for all files to reach Probed state
     coordinator.wait_for_sync(SyncPoint::AfterProbed)?;
 
-    // Phase 2: Extract frames in parallel
-    extract_frames_parallel(&processors_arc, config)?;
+    // Phase 2: Extract frames in parallel (video and/or audio)
+    if !config.audio_only {
+        extract_frames_parallel(&processors_arc, config)?;
+    }
+    
+    if config.enable_audio_matching || config.audio_only {
+        extract_audio_parallel(&processors_arc, config)?;
+    }
 
     // Phase 3: Analyze frames in parallel
-    analyze_frames_parallel(&processors_arc, config)?;
+    if !config.audio_only {
+        analyze_frames_parallel(&processors_arc, config)?;
+    }
 
     // SYNC POINT 2: Wait for all files to reach Analyzed state
     coordinator.wait_for_sync(SyncPoint::AfterAnalyzed)?;
 
-    // Phase 4: Find repeated segments globally
+    // Phase 4: Find repeated segments globally (audio and/or video)
     find_repeated_segments(&processors_arc, config)?;
 
     // Phase 5: Cut files in parallel
@@ -212,10 +226,10 @@ fn extract_single_file(
     // Get video info
     let video_info = get_processor_video_info(processors_arc, file_path)?;
 
-    // Transition to Extracting state
+    // Transition to ExtractingVideo state
     let estimated_frames = estimate_frame_count(&video_info, config);
     update_processor_state(processors_arc, file_path, |p| {
-        p.transition_to(ProcessingState::Extracting {
+        p.transition_to(ProcessingState::ExtractingVideo {
             frames_processed: 0,
             frames_total: estimated_frames,
         });
@@ -223,7 +237,7 @@ fn extract_single_file(
 
     if config.debug {
         println!(
-            "🔄 Started extracting: {} ({} frames)",
+            "🔄 Started extracting video: {} ({} frames)",
             file_path.file_name().unwrap_or_default().to_string_lossy(),
             estimated_frames
         );
@@ -235,10 +249,10 @@ fn extract_single_file(
         extract_frames_with_state_machine_progress(file_path, sample_rate, processors_arc, config)?;
     let actual_frame_count = frames.frames.len();
 
-    // Transition to Extracted state
+    // Transition to ExtractedVideo state
     update_processor_state(processors_arc, file_path, |p| {
         p.set_frames(frames);
-        p.transition_to(ProcessingState::Extracted {
+        p.transition_to(ProcessingState::ExtractedVideo {
             frames_processed: actual_frame_count,
             frames_total: actual_frame_count,
         });
@@ -293,7 +307,7 @@ fn extract_frames_with_state_machine_progress(
                 &processors_arc_clone,
                 &video_path_for_callback,
                 |p| {
-                    p.update_extracting(current, total);
+                    p.update_extracting_video(current, total);
                 },
             ) {
                 eprintln!("Failed to update processor state: {}", e);
@@ -319,6 +333,115 @@ fn extract_frames_with_state_machine_progress(
         episode_path: video_path.clone(),
         frames,
     })
+}
+
+/// Extract audio from all files in parallel
+fn extract_audio_parallel(
+    processors_arc: &Arc<Mutex<Vec<FileProcessor>>>,
+    config: &Config,
+) -> Result<()> {
+    let file_paths = {
+        let processors_guard = processors_arc.lock().unwrap();
+        processors_guard
+            .iter()
+            .map(|p| p.file_path.clone())
+            .collect::<Vec<_>>()
+    };
+
+    if config.debug {
+        println!("🎵 Starting audio extraction phase...");
+    }
+
+    // Create thread pool with limited workers
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.parallel_workers)
+        .build()
+        .unwrap();
+
+    pool.install(|| {
+        file_paths.par_iter().for_each(|file_path| {
+            if let Err(e) = extract_audio_single_file(file_path, processors_arc, config) {
+                eprintln!("Failed to extract audio from {:?}: {}", file_path, e);
+            }
+        });
+    });
+
+    if config.debug {
+        println!("🎵 Completed audio extraction phase");
+    }
+
+    Ok(())
+}
+
+/// Extract audio from a single file
+fn extract_audio_single_file(
+    file_path: &PathBuf,
+    processors_arc: &Arc<Mutex<Vec<FileProcessor>>>,
+    config: &Config,
+) -> Result<()> {
+    if config.debug {
+        println!(
+            "🎵 Extracting audio: {}",
+            file_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    let sample_rate_hz = 22050; // 22.05 kHz mono audio
+    let frame_rate = if config.quick { 0.5 } else { 1.0 }; // Audio frames per second
+
+    // Extract raw audio samples with progress tracking
+    let processors_clone = processors_arc.clone();
+    let file_path_clone = file_path.clone();
+    let audio_samples = extract_audio_samples(
+        file_path,
+        sample_rate_hz,
+        move |current, total| {
+            let _ = update_processor_state(&processors_clone, &file_path_clone, |p| {
+                // Use ExtractingAudio state
+                p.state = ProcessingState::ExtractingAudio {
+                    samples_processed: current,
+                    samples_total: total,
+                };
+            });
+        },
+    )?;
+
+    // Process audio samples into audio frames with spectral hashes
+    let audio_frames = process_audio_samples(&audio_samples, sample_rate_hz as f32, frame_rate)?;
+
+    // Store audio frames in processor
+    let episode_audio = EpisodeAudio {
+        episode_path: file_path.clone(),
+        audio_frames,
+    };
+
+    if config.debug {
+        println!(
+            "🎵 Extracted {} audio frames from {}",
+            episode_audio.audio_frames.len(),
+            file_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    // Update processor with audio frames and transition to ExtractedAudio
+    let audio_frame_count = episode_audio.audio_frames.len();
+    update_processor_state(processors_arc, file_path, |p| {
+        p.audio_frames = Some(episode_audio);
+        p.transition_to(ProcessingState::ExtractedAudio {
+            samples_processed: audio_frame_count,
+            samples_total: audio_frame_count,
+        });
+    })?;
+
+    if config.debug {
+        println!(
+            "🎵 Completed extracting audio: {} ({} frames)",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            audio_frame_count
+        );
+    }
+
+    Ok(())
 }
 
 /// Analyze frames from all files in parallel
@@ -416,20 +539,24 @@ fn find_repeated_segments(
     processors_arc: &Arc<Mutex<Vec<FileProcessor>>>,
     config: &Config,
 ) -> Result<()> {
-    // Get all frames from all files
-    let all_frames = {
+    // Get all frames and audio from all files
+    let (all_frames, all_audio) = {
         let processors_guard = processors_arc.lock().unwrap();
         let mut frames = Vec::new();
+        let mut audio = Vec::new();
 
         for processor in processors_guard.iter() {
             if let Some(ref file_frames) = processor.frames {
                 frames.push(file_frames.clone());
             }
+            if let Some(ref file_audio) = processor.audio_frames {
+                audio.push(file_audio.clone());
+            }
         }
-        frames
+        (frames, audio)
     };
 
-    if all_frames.is_empty() {
+    if all_frames.is_empty() && all_audio.is_empty() {
         return Ok(());
     }
 
@@ -443,21 +570,68 @@ fn find_repeated_segments(
         }
     }
 
-    // Detect common segments
-    let common_segments = detect_common_segments(&all_frames, config, config.debug_dupes)?;
-    let merged_segments = merge_overlapping_segments(common_segments);
+    // Detect segments based on configuration
+    let final_segments = if config.audio_only {
+        // Audio-only mode
+        if all_audio.is_empty() {
+            Vec::new()
+        } else {
+            let audio_segments = match config.audio_algorithm {
+                crate::AudioAlgorithm::SpectralHash => {
+                    detect_audio_segments(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::CrossCorrelation => {
+                    detect_audio_segments_correlation(&all_audio, config, config.debug_dupes)?
+                }
+            };
+            merge_overlapping_segments(audio_segments)
+        }
+    } else if config.enable_audio_matching {
+        // Combined audio + video mode
+        let video_segments = if all_frames.is_empty() {
+            Vec::new()
+        } else {
+            detect_common_segments(&all_frames, config, config.debug_dupes)?
+        };
+        
+        let audio_segments = if all_audio.is_empty() {
+            Vec::new()
+        } else {
+            // Use selected audio algorithm
+            match config.audio_algorithm {
+                crate::AudioAlgorithm::SpectralHash => {
+                    detect_audio_segments(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::CrossCorrelation => {
+                    detect_audio_segments_correlation(&all_audio, config, config.debug_dupes)?
+                }
+            }
+        };
+
+        // Combine and merge
+        let combined = combine_audio_video_segments(video_segments, audio_segments);
+        merge_overlapping_segments(combined)
+    } else {
+        // Video-only mode (default)
+        if all_frames.is_empty() {
+            Vec::new()
+        } else {
+            let video_segments = detect_common_segments(&all_frames, config, config.debug_dupes)?;
+            merge_overlapping_segments(video_segments)
+        }
+    };
 
     // Update all processors with duplicate segments
     {
         let mut processors_guard = processors_arc.lock().unwrap();
         for processor in processors_guard.iter_mut() {
             if !processor.state.is_failed() {
-                let duplicates = merged_segments
+                let duplicates = final_segments
                     .iter()
                     .map(|s| (s.start_time, s.end_time))
                     .collect();
                 processor.set_duplicates(duplicates);
-                processor.set_common_segments(merged_segments.clone());
+                processor.set_common_segments(final_segments.clone());
                 processor.transition_to(ProcessingState::Cutting { progress: 0.0 });
             }
         }

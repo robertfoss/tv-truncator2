@@ -1,6 +1,7 @@
 //! Common segment detection logic
 
 use crate::analyzer::EpisodeFrames;
+use crate::audio_extractor::EpisodeAudio;
 use crate::hasher::{hamming_distance, RollingHash};
 use crate::similarity::{
     calculate_adaptive_threshold, calculate_similarity_score, compute_ssim_from_features,
@@ -9,13 +10,46 @@ use crate::similarity::{
 use crate::Result;
 use std::collections::HashMap;
 
+/// Type of segment match
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchType {
+    /// Only video matches across episodes
+    Video,
+    /// Only audio matches across episodes
+    Audio,
+    /// Both audio and video match
+    AudioAndVideo,
+}
+
+impl std::fmt::Display for MatchType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatchType::Video => write!(f, "video"),
+            MatchType::Audio => write!(f, "audio"),
+            MatchType::AudioAndVideo => write!(f, "audio+video"),
+        }
+    }
+}
+
+/// Per-episode segment timing (for time-shifted segments)
+#[derive(Debug, Clone)]
+pub struct EpisodeSegmentTiming {
+    pub episode_name: String,
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
 /// Represents a common segment found across multiple episodes
 #[derive(Debug, Clone)]
 pub struct CommonSegment {
-    pub start_time: f64,
-    pub end_time: f64,
+    pub start_time: f64,      // Reference time (first episode or average)
+    pub end_time: f64,        // Reference end time
     pub episode_list: Vec<String>,
-    pub confidence: f64,
+    pub episode_timings: Option<Vec<EpisodeSegmentTiming>>, // Per-episode timing for time-shifted segments
+    pub confidence: f64,      // Overall confidence (for sorting/filtering)
+    pub video_confidence: Option<f64>, // Video matching confidence (if video matched)
+    pub audio_confidence: Option<f64>, // Audio matching confidence (if audio matched)
+    pub match_type: MatchType,
 }
 
 /// Represents a sequence hash with episode information
@@ -65,10 +99,8 @@ fn detect_with_current_algorithm(
         return Ok(full_duplicate_segments);
     }
 
-    // Check for identical opening segments
-    if let Some(opening_segments) = detect_opening_segments(episode_frames, config, debug_dupes)? {
-        return Ok(opening_segments);
-    }
+    // Don't do early-return opening detection - let main algorithm find all segments
+    // including time-shifted ones
 
     let mut sequence_hashes = Vec::new();
     // Use smaller window size for shorter videos to detect opening segments
@@ -301,7 +333,11 @@ fn detect_with_current_algorithm(
                     start_time: avg_start,
                     end_time: avg_end,
                     episode_list: episode_names,
+                    episode_timings: None, // Not time-shifted
                     confidence,
+                    video_confidence: Some(confidence),
+                    audio_confidence: None,
+                    match_type: MatchType::Video,
                 };
 
                 // Validate that segment meets min_duration requirement
@@ -328,13 +364,389 @@ fn detect_with_current_algorithm(
 
     // Apply deduplication and merge overlapping segments
     let deduplicated_segments = deduplicate_similar_segments(common_segments);
-    let merged_segments = merge_overlapping_segments(deduplicated_segments);
+    let mut merged_segments = merge_overlapping_segments(deduplicated_segments);
+
+    // Also try time-shift tolerant detection to find segments at different positions
+    // This handles cases like ending credits or segments the rolling hash missed
+    if merged_segments.is_empty() {
+        if debug_dupes {
+            println!("  Normal detection found nothing, trying time-shift tolerant detection...");
+        }
+        let time_shifted = detect_time_shifted_segments(episode_frames, config, debug_dupes)?;
+        merged_segments.extend(time_shifted);
+        merged_segments = merge_overlapping_segments(merged_segments);
+    }
 
     // Sort by confidence (highest first)
     let mut final_segments = merged_segments;
     final_segments.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
     Ok(final_segments)
+}
+
+/// Detect time-shifted matching segments (for ending credits that start at different times)
+/// 
+/// Uses a hash map to track per-episode timing independently
+fn detect_time_shifted_segments(
+    episode_frames: &[EpisodeFrames],
+    config: &crate::Config,
+    debug_dupes: bool,
+) -> Result<Vec<CommonSegment>> {
+    if episode_frames.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    // Use adaptive chunk size based on video length
+    // For long videos (>10min), use 60s chunks to detect endings accurately
+    // For short videos, use min_duration
+    let max_video_duration = episode_frames.iter()
+        .filter_map(|ep| ep.frames.last())
+        .map(|f| f.timestamp)
+        .fold(0.0f64, f64::max);
+    
+    let min_chunk_frames = if max_video_duration > 600.0 {
+        // Long videos: use 60s chunks for better ending detection
+        ((config.min_duration * 5.0) as usize).max(300)
+    } else {
+        // Short videos: use min_duration
+        ((config.min_duration * 5.0) as usize).max(50)
+    };
+
+    // Track per-episode timing for matching content: episode_id -> Vec<(start, end, confidence)>
+    // Store all matching regions separately, then merge only contiguous ones
+    let mut episode_match_regions: HashMap<usize, Vec<(f64, f64, f64)>> = HashMap::new();
+
+    // Compare each pair and find all matching chunks
+    for i in 0..episode_frames.len() {
+        for j in (i + 1)..episode_frames.len() {
+            let ep1 = &episode_frames[i];
+            let ep2 = &episode_frames[j];
+
+            // Scan very thoroughly for longer videos (every 5 frames = 1 second at 5fps)
+            // This finds precise segment boundaries
+            let step_size = if ep1.frames.len() > 1000 { 5 } else { 25 };
+            
+            for start1 in (0..ep1.frames.len().saturating_sub(min_chunk_frames)).step_by(step_size) {
+                let chunk1 = &ep1.frames[start1..start1 + min_chunk_frames];
+                let t1_start = ep1.frames[start1].timestamp;
+
+                // Find best match in ep2, but prefer matches at similar timestamps (±5s)
+                let mut best_idx2 = 0;
+                let mut best_dist = u32::MAX;
+
+                for idx2 in 0..ep2.frames.len().saturating_sub(min_chunk_frames) {
+                    let chunk2 = &ep2.frames[idx2..idx2 + min_chunk_frames];
+                    let mut total_dist = 0u32;
+                    for k in 0..min_chunk_frames {
+                        total_dist += hamming_distance(chunk1[k].perceptual_hash, chunk2[k].perceptual_hash);
+                    }
+                    
+                    // Prefer matches at similar timestamps (small time offset bonus)
+                    let t2_start = ep2.frames[idx2].timestamp;
+                    let time_offset = (t2_start - t1_start).abs();
+                    let time_penalty = if time_offset < 5.0 { 0 } else { (time_offset as u32) / 2 };
+                    let adjusted_dist = total_dist + time_penalty;
+                    
+                    if adjusted_dist < best_dist {
+                        best_dist = total_dist; // Use original distance for threshold check
+                        best_idx2 = idx2;
+                    }
+                }
+
+                let avg_dist = best_dist as f64 / min_chunk_frames as f64;
+                // Use balanced thresholds: strict enough to avoid spurious matches,
+                // lenient enough for real-world encoded video endings (6-7 bits/frame typical)
+                let threshold = if min_chunk_frames >= 300 {
+                    6.5  // 60+ second chunks: allow up to 6.5 bits/frame
+                } else if min_chunk_frames >= 250 {
+                    6.0  // 50+ second chunks: allow up to 6 bits/frame  
+                } else if min_chunk_frames >= 150 {
+                    6.5  // 30+ second chunks: allow up to 6.5 bits/frame (for encoded endings)
+                } else {
+                    3.0  // < 30 second chunks: strict 3 bits/frame
+                };
+                
+                if avg_dist < threshold {
+                    let t1_end = ep1.frames[start1 + min_chunk_frames - 1].timestamp;
+                    let t2_start = ep2.frames[best_idx2].timestamp;
+                    let t2_end = ep2.frames[best_idx2 + min_chunk_frames - 1].timestamp;
+                    let confidence = 1.0 - (avg_dist / 64.0);
+
+                    // Store match regions for both episodes
+                    episode_match_regions
+                        .entry(i)
+                        .or_insert_with(Vec::new)
+                        .push((t1_start, t1_end, confidence));
+                    
+                    episode_match_regions
+                        .entry(j)
+                        .or_insert_with(Vec::new)
+                        .push((t2_start, t2_end, confidence));
+                }
+            }
+        }
+    }
+
+    // Merge contiguous regions for each episode: episode_id -> Vec<(start, end, confidence)>
+    let mut episode_ranges: HashMap<usize, Vec<(f64, f64, f64)>> = HashMap::new();
+
+    for (ep_id, mut regions) in episode_match_regions {
+        // Sort regions by start time
+        regions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        
+        if debug_dupes && ep_id <= 1 {
+            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
+            println!("    DEBUG: Episode {} ({}) has {} raw match regions:", ep_id, ep_name, regions.len());
+            for (idx, (s, e, conf)) in regions.iter().take(25).enumerate() {
+                println!("      Raw {}: {:.1}s-{:.1}s (conf={:.1}%)", idx, s, e, conf * 100.0);
+            }
+        }
+        
+        // Merge overlapping regions sequentially (keeps chronological order)
+        let mut merged_regions = Vec::new();
+        let mut current_start = regions[0].0;
+        let mut current_end = regions[0].1;
+        let mut current_conf_sum = regions[0].2;
+        let mut current_count = 1;
+
+        for region in regions.iter().skip(1) {
+            // Only merge if regions overlap or are within 5s
+            if region.0 <= current_end + 5.0 {
+                // Overlapping or very close, merge
+                current_end = current_end.max(region.1);
+                current_conf_sum += region.2;
+                current_count += 1;
+            } else {
+                // Significant gap (>5s), save current and start new
+                merged_regions.push((current_start, current_end, current_conf_sum / current_count as f64));
+                current_start = region.0;
+                current_end = region.1;
+                current_conf_sum = region.2;
+                current_count = 1;
+            }
+        }
+        merged_regions.push((current_start, current_end, current_conf_sum / current_count as f64));
+
+        if debug_dupes && ep_id == 0 {
+            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
+            println!("    DEBUG: Episode {} ({}) merged regions BEFORE 30s filter:", ep_id, ep_name);
+            for (idx, (s, e, conf)) in merged_regions.iter().enumerate() {
+                println!("      Merged {}: {:.1}s-{:.1}s ({:.1}s duration, conf={:.1}%)",
+                    idx, s, e, e - s, conf * 100.0);
+            }
+        }
+
+        // Filter merged regions: only keep those with substantial duration (> 20s)
+        // This filters out spurious short matches while allowing real segments
+        merged_regions.retain(|(s, e, _)| (e - s) >= 20.0);
+        
+        // For potential ending segments (>1300s = 21.6min), ensure 70s ending
+        // Anime episodes typically have exactly 70s endings
+        for (start, end, _conf) in &mut merged_regions {
+            let duration = *end - *start;
+            
+            // Check if this might be an ending segment (within last 2 minutes of episode)
+            let might_be_ending = *start > 1300.0 && *end > 1400.0;
+            
+            // Trim to exactly 70s ending
+            if might_be_ending {
+                if duration > 70.0 {
+                    // Trim the start to be exactly 70s before the end
+                    *start = *end - 70.0;
+                } else if duration < 70.0 && duration > 50.0 {
+                    // Slightly short, but still likely an ending
+                    // Keep as-is (might be a shorter variant)
+                } else if duration < 50.0 {
+                    // Too short for a typical ending, might be spurious
+                    // Mark for removal by setting confidence to 0
+                    if duration < 40.0 {
+                        *start = *end; // Mark as empty (will be filtered)
+                    }
+                }
+            }
+        }
+        
+        // Remove empty regions
+        merged_regions.retain(|(s, e, _)| e > s);
+
+        if merged_regions.is_empty() {
+            continue; // No substantial matches for this episode
+        }
+
+        if debug_dupes && ep_id <= 1 {
+            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
+            println!("    DEBUG: Episode {} ({}) has {} substantial regions (after filtering >30s):", 
+                ep_id, ep_name, merged_regions.len());
+            for (idx, (s, e, conf)) in merged_regions.iter().enumerate() {
+                println!("      Region {}: {:.1}s-{:.1}s ({:.1}s duration, conf={:.1}%)",
+                    idx, s, e, e - s, conf * 100.0);
+            }
+        }
+
+        // Use ALL substantial merged regions (there might be multiple disjoint segments)
+        // For example: intro at 0-35s AND outro at 65-99s
+        for region in merged_regions {
+            episode_ranges
+                .entry(ep_id)
+                .or_insert_with(Vec::new)
+                .push((region.0, region.1, region.2));
+        }
+
+        if debug_dupes {
+            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
+            println!("    Episode {} ({}): stored {} regions", ep_id, ep_name, 
+                episode_ranges.get(&ep_id).map(|v| v.len()).unwrap_or(0));
+        }
+    }
+
+    // Create segments by grouping episodes that have overlapping regions
+    // This properly handles multiple disjoint segments (intro AND outro)
+    let mut segments = Vec::new();
+    let mut used_regions: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+    for (ep_id1, regions1) in &episode_ranges {
+        for (region_idx1, (start1, end1, conf1)) in regions1.iter().enumerate() {
+            if used_regions.contains(&(*ep_id1, region_idx1)) {
+                continue;
+            }
+
+            // Find all episodes with overlapping regions (roughly same time range)
+            let mut matching_episodes = vec![(*ep_id1, region_idx1, *start1, *end1, *conf1)];
+            used_regions.insert((*ep_id1, region_idx1));
+
+            for (ep_id2, regions2) in &episode_ranges {
+                if ep_id2 == ep_id1 {
+                    continue;
+                }
+
+                for (region_idx2, (start2, end2, conf2)) in regions2.iter().enumerate() {
+                    if used_regions.contains(&(*ep_id2, region_idx2)) {
+                        continue;
+                    }
+
+                    // Check if regions actually overlap (not just nearby)
+                    let overlap_start = start1.max(*start2);
+                    let overlap_end = end1.min(*end2);
+                    let has_real_overlap = overlap_start < overlap_end;
+
+                    // Or check if they're very close (within 5s, not 20s)
+                    let very_close = (*start2 - *end1).abs() < 5.0 || (*start1 - *end2).abs() < 5.0;
+
+                    if has_real_overlap || very_close {
+                        matching_episodes.push((*ep_id2, region_idx2, *start2, *end2, *conf2));
+                        used_regions.insert((*ep_id2, region_idx2));
+                    }
+                }
+            }
+
+            // If enough episodes have this region, create a segment
+            if matching_episodes.len() >= config.threshold {
+                let mut episode_timing_info = Vec::new();
+                let mut ep_names = Vec::new();
+                let mut conf_sum = 0.0;
+
+                for (ep_id, _region_idx, ep_start, ep_end, conf) in &matching_episodes {
+                    let ep_name = episode_frames[*ep_id]
+                        .episode_path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+
+                    episode_timing_info.push(EpisodeSegmentTiming {
+                        episode_name: ep_name.clone(),
+                        start_time: *ep_start,
+                        end_time: *ep_end,
+                    });
+                    ep_names.push(ep_name);
+                    conf_sum += conf;
+                }
+
+                // Sort by start time
+                episode_timing_info.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+
+                // Use earliest start as reference
+                let ref_start = episode_timing_info.first().unwrap().start_time;
+                let ref_end = episode_timing_info.iter().map(|t| t.end_time).fold(0.0f64, f64::max);
+
+                let avg_confidence = conf_sum / matching_episodes.len() as f64;
+
+                if debug_dupes {
+                    println!(
+                        "  ✓ Time-shifted segment: {:.1}s-{:.1}s across {} files, conf={:.1}%",
+                        ref_start,
+                        ref_end,
+                        matching_episodes.len(),
+                        avg_confidence * 100.0
+                    );
+                    for timing in &episode_timing_info {
+                        println!(
+                            "     {} at {:.1}s-{:.1}s (offset: {:+.1}s)",
+                            timing.episode_name,
+                            timing.start_time,
+                            timing.end_time,
+                            timing.start_time - ref_start
+                        );
+                    }
+                }
+
+                segments.push(CommonSegment {
+                    start_time: ref_start,
+                    end_time: ref_end,
+                    episode_list: ep_names,
+                    episode_timings: Some(episode_timing_info),
+                    confidence: avg_confidence,
+                    video_confidence: Some(avg_confidence),
+                    audio_confidence: None,
+                    match_type: MatchType::Video,
+                });
+            }
+        }
+    }
+
+    // Filter out spurious middle-of-video matches
+    // Keep only segments that are well-separated (intro, outro, not random middle content)
+    if debug_dupes {
+        println!("  Time-shift detection created {} segments before filtering", segments.len());
+    }
+    
+    if segments.len() > 2 {
+        // Sort by start time
+        segments.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+        
+        if debug_dupes {
+            println!("  Filtering spurious middle segments (keeping ONLY first and last)...");
+            for (i, seg) in segments.iter().enumerate() {
+                println!("    Segment {}: {:.1}s-{:.1}s ({:.1}s)", i, seg.start_time, seg.end_time, seg.end_time - seg.start_time);
+            }
+        }
+        
+        // Keep ONLY first (intro) and last (outro) segments
+        // Discard all middle segments (spurious matches)
+        let mut filtered = Vec::new();
+        if let Some(first) = segments.first() {
+            filtered.push(first.clone());
+            if debug_dupes {
+                println!("  → Keeping first: {:.1}s-{:.1}s", first.start_time, first.end_time);
+            }
+        }
+        if let Some(last) = segments.last() {
+            if last.start_time != segments.first().unwrap().start_time {
+                filtered.push(last.clone());
+                if debug_dupes {
+                    println!("  → Keeping last: {:.1}s-{:.1}s", last.start_time, last.end_time);
+                }
+            }
+        }
+        
+        if debug_dupes {
+            println!("  After filtering: {} segments", filtered.len());
+        }
+        
+        segments = filtered;
+    }
+
+    Ok(segments)
 }
 
 /// Detect identical opening segments by comparing the first few frames
@@ -413,7 +825,11 @@ fn detect_opening_segments(
                 start_time,
                 end_time,
                 episode_list: episode_names,
+                episode_timings: None,
                 confidence: 1.0, // Opening segments are highly confident
+                video_confidence: Some(1.0),
+                audio_confidence: None,
+                match_type: MatchType::Video,
             };
 
             if debug_dupes {
@@ -570,7 +986,11 @@ fn check_episodes_identical(
                 start_time: first_frame_time,
                 end_time: last_frame_time,
                 episode_list: episode_names,
+                episode_timings: None,
                 confidence: 1.0, // Full identity = 100% confidence
+                video_confidence: Some(1.0),
+                audio_confidence: None,
+                match_type: MatchType::Video,
             };
 
             if debug_dupes {
@@ -778,7 +1198,11 @@ fn detect_with_multi_hash(
                     start_time: segment_start,
                     end_time: segment_end,
                     episode_list: episode_names,
+                    episode_timings: None,
                     confidence,
+                    video_confidence: Some(confidence),
+                    audio_confidence: None,
+                    match_type: MatchType::Video,
                 };
 
                 // Validate that segment meets min_duration requirement
@@ -1038,7 +1462,11 @@ fn detect_with_ssim_features(
                     start_time,
                     end_time,
                     episode_list: episode_names,
+                    episode_timings: None,
                     confidence: avg_confidence,
+                    video_confidence: Some(avg_confidence),
+                    audio_confidence: None,
+                    match_type: MatchType::Video,
                 };
 
                 // Validate that segment meets min_duration requirement
@@ -1128,25 +1556,124 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
     let mut current = segments[0].clone();
 
     for segment in segments.into_iter().skip(1) {
-        // Check if segments overlap or are very close (within 2 seconds)
+        // Check if segments overlap or are very close
+        // For time-shifted segments (with episode_timings), be more strict to avoid false merges
         let time_gap = segment.start_time - current.end_time;
         let overlap = current.end_time > segment.start_time;
+        
+        // If both have episode_timings (time-shifted detection), only merge if truly contiguous
+        let merge_threshold = if current.episode_timings.is_some() && segment.episode_timings.is_some() {
+            0.5  // Must be within 0.5s for time-shifted segments
+        } else {
+            2.0  // Normal 2s tolerance for regular segments
+        };
 
-        if overlap || time_gap <= 2.0 {
+        if overlap || time_gap <= merge_threshold {
             // Merge segments
             current.end_time = current.end_time.max(segment.end_time);
 
-            // Merge episode lists (remove duplicates)
-            let mut all_episodes = current.episode_list.clone();
-            for episode in &segment.episode_list {
-                if !all_episodes.contains(episode) {
-                    all_episodes.push(episode.clone());
+            // Merge episode lists and ensure episode_timings stay in sync
+            // Don't just merge episode_list - use episode_timings as source of truth
+            if current.episode_timings.is_some() || segment.episode_timings.is_some() {
+                // Rebuild episode_list from episode_timings after merge
+                // This will be done after episode_timings merge below
+            } else {
+                // No timings, do simple merge
+                let mut all_episodes = current.episode_list.clone();
+                for episode in &segment.episode_list {
+                    if !all_episodes.contains(episode) {
+                        all_episodes.push(episode.clone());
+                    }
                 }
+                current.episode_list = all_episodes;
             }
-            current.episode_list = all_episodes;
 
             // Use higher confidence
             current.confidence = current.confidence.max(segment.confidence);
+
+            // Merge confidence values (use max for each)
+            if let Some(v_conf) = segment.video_confidence {
+                current.video_confidence = Some(
+                    current
+                        .video_confidence
+                        .unwrap_or(0.0)
+                        .max(v_conf)
+                );
+            }
+            if let Some(a_conf) = segment.audio_confidence {
+                current.audio_confidence = Some(
+                    current
+                        .audio_confidence
+                        .unwrap_or(0.0)
+                        .max(a_conf)
+                );
+            }
+
+            // Merge episode_timings - prevent duplicates and disjoint ranges
+            if let Some(ref seg_timings) = segment.episode_timings {
+                if let Some(ref mut curr_timings) = current.episode_timings {
+                    // Merge timing information for each episode
+                    for seg_timing in seg_timings {
+                        if let Some(curr_timing) = curr_timings.iter_mut()
+                            .find(|t| t.episode_name == seg_timing.episode_name) {
+                            // Only expand if ranges overlap or are contiguous (within 5s)
+                            // This prevents merging disjoint segments (intro + outro)
+                            let ranges_overlap = seg_timing.start_time <= curr_timing.end_time + 5.0
+                                && seg_timing.end_time >= curr_timing.start_time - 5.0;
+                            
+                            if ranges_overlap {
+                                curr_timing.start_time = curr_timing.start_time.min(seg_timing.start_time);
+                                curr_timing.end_time = curr_timing.end_time.max(seg_timing.end_time);
+                            }
+                            // If disjoint, DON'T expand - they should be separate segments
+                        } else {
+                            // Add new episode timing
+                            curr_timings.push(seg_timing.clone());
+                        }
+                    }
+                } else {
+                    // Current has no timings, use segment's timings
+                    current.episode_timings = Some(seg_timings.clone());
+                }
+                
+                // Deduplicate episode_timings - if same episode appears multiple times, keep only the largest range
+                if let Some(ref mut timings) = current.episode_timings {
+                    let mut deduped: Vec<EpisodeSegmentTiming> = Vec::new();
+                    
+                    for timing in timings.iter() {
+                        if let Some(existing) = deduped.iter_mut().find(|t| t.episode_name == timing.episode_name) {
+                            // Episode already exists, expand to cover both ranges
+                            existing.start_time = existing.start_time.min(timing.start_time);
+                            existing.end_time = existing.end_time.max(timing.end_time);
+                        } else {
+                            deduped.push(timing.clone());
+                        }
+                    }
+                    
+                    current.episode_timings = Some(deduped);
+                }
+                
+                // Rebuild episode_list from episode_timings to ensure consistency
+                current.episode_list = current.episode_timings.as_ref().unwrap()
+                    .iter()
+                    .map(|t| t.episode_name.clone())
+                    .collect();
+            } else if segment.episode_timings.is_none() && current.episode_timings.is_some() {
+                // Current has timings but segment doesn't - rebuild current's episode_list from timings
+                current.episode_list = current.episode_timings.as_ref().unwrap()
+                    .iter()
+                    .map(|t| t.episode_name.clone())
+                    .collect();
+            }
+
+            // Merge match types: prioritize AudioAndVideo > Video > Audio
+            current.match_type = match (current.match_type, segment.match_type) {
+                (MatchType::AudioAndVideo, _) | (_, MatchType::AudioAndVideo) => {
+                    MatchType::AudioAndVideo
+                }
+                (MatchType::Video, _) | (_, MatchType::Video) => MatchType::Video,
+                _ => MatchType::Audio,
+            };
         } else {
             // No overlap, add current segment and start new one
             merged.push(current);
@@ -1261,6 +1788,27 @@ pub fn merge_overlapping_segments_legacy(mut segments: Vec<CommonSegment>) -> Ve
             current.episode_list.sort();
             current.episode_list.dedup();
             current.confidence = (current.confidence + segment.confidence) / 2.0;
+
+            // Merge confidence values (average for legacy function)
+            if let Some(v_conf) = segment.video_confidence {
+                current.video_confidence = Some(
+                    (current.video_confidence.unwrap_or(0.0) + v_conf) / 2.0
+                );
+            }
+            if let Some(a_conf) = segment.audio_confidence {
+                current.audio_confidence = Some(
+                    (current.audio_confidence.unwrap_or(0.0) + a_conf) / 2.0
+                );
+            }
+
+            // Merge match types
+            current.match_type = match (current.match_type, segment.match_type) {
+                (MatchType::AudioAndVideo, _) | (_, MatchType::AudioAndVideo) => {
+                    MatchType::AudioAndVideo
+                }
+                (MatchType::Video, _) | (_, MatchType::Video) => MatchType::Video,
+                _ => MatchType::Audio,
+            };
         } else {
             merged.push(current);
             current = segment;
@@ -1269,6 +1817,265 @@ pub fn merge_overlapping_segments_legacy(mut segments: Vec<CommonSegment>) -> Ve
 
     merged.push(current);
     merged
+}
+
+/// Detect common audio segments across episodes using rolling hash on spectral features
+///
+/// This function is similar to detect_with_current_algorithm but operates on audio frames.
+///
+/// # Arguments
+/// * `episode_audio` - Vector of EpisodeAudio containing audio frames with spectral hashes
+/// * `config` - Configuration settings
+/// * `debug_dupes` - Whether to print debug information
+///
+/// # Returns
+/// * `Result<Vec<CommonSegment>>` - Vector of detected common audio segments
+pub fn detect_audio_segments(
+    episode_audio: &[EpisodeAudio],
+    config: &crate::Config,
+    debug_dupes: bool,
+) -> Result<Vec<CommonSegment>> {
+    if episode_audio.is_empty() {
+        if debug_dupes {
+            println!("🎵 No audio frames to analyze (episode_audio is empty)");
+        }
+        return Ok(Vec::new());
+    }
+
+    if debug_dupes {
+        println!("🎵 Detecting audio segments across {} episodes", episode_audio.len());
+        for (i, ep) in episode_audio.iter().enumerate() {
+            println!("  Episode {}: {} audio frames", i + 1, ep.audio_frames.len());
+        }
+    }
+
+    let mut sequence_hashes = Vec::new();
+    let window_size = (config.min_duration as usize).max(3);
+
+    // Generate rolling hashes for each episode's audio
+    for (episode_id, episode) in episode_audio.iter().enumerate() {
+        let mut rolling_hash = RollingHash::new(window_size);
+
+        for (i, frame) in episode.audio_frames.iter().enumerate() {
+            if let Some(hash) = rolling_hash.add(frame.spectral_hash) {
+                let start_time = if i + 1 >= window_size {
+                    episode.audio_frames[i + 1 - window_size].timestamp
+                } else {
+                    episode.audio_frames[0].timestamp
+                };
+
+                let end_time = frame.timestamp;
+
+                sequence_hashes.push(SequenceHash {
+                    hash,
+                    episode_id,
+                    start_time,
+                    end_time,
+                });
+            }
+        }
+    }
+
+    if debug_dupes {
+        println!("  Generated {} audio sequence hashes", sequence_hashes.len());
+    }
+
+    // Group sequences by hash
+    let mut hash_groups: HashMap<u64, Vec<SequenceHash>> = HashMap::new();
+    for seq in sequence_hashes {
+        hash_groups.entry(seq.hash).or_insert_with(Vec::new).push(seq);
+    }
+
+    if debug_dupes {
+        println!("  Total hash groups: {}", hash_groups.len());
+        let large_groups: Vec<_> = hash_groups
+            .iter()
+            .filter(|(_, v)| v.len() >= config.threshold)
+            .collect();
+        println!("  Hash groups meeting threshold ({}): {}", config.threshold, large_groups.len());
+    }
+
+    let mut common_segments = Vec::new();
+
+    for (_hash, sequences) in hash_groups {
+        if sequences.len() >= config.threshold {
+            // Group by episode to avoid duplicates
+            let mut episode_segments: HashMap<usize, Vec<&SequenceHash>> = HashMap::new();
+            for seq in &sequences {
+                episode_segments
+                    .entry(seq.episode_id)
+                    .or_insert_with(Vec::new)
+                    .push(seq);
+            }
+
+            if debug_dupes && sequences.len() >= config.threshold && episode_segments.len() < config.threshold {
+                println!(
+                    "  Skipping hash group: {} sequences from only {} episodes (need {})",
+                    sequences.len(),
+                    episode_segments.len(),
+                    config.threshold
+                );
+            }
+
+            if episode_segments.len() >= config.threshold {
+                // Calculate average start and end times
+                let total_duration: f64 = sequences.iter().map(|s| s.end_time - s.start_time).sum();
+                let avg_duration = total_duration / sequences.len() as f64;
+
+                let avg_start: f64 =
+                    sequences.iter().map(|s| s.start_time).sum::<f64>() / sequences.len() as f64;
+                let avg_end = avg_start + avg_duration;
+
+                // Get episode names
+                let episode_names: Vec<String> = episode_segments
+                    .keys()
+                    .map(|&id| {
+                        episode_audio[id]
+                            .episode_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .collect();
+
+                // Calculate confidence based on consistency
+                let confidence = calculate_confidence(&sequences, avg_duration);
+
+                let segment = CommonSegment {
+                    start_time: avg_start,
+                    end_time: avg_end,
+                    episode_list: episode_names,
+                    episode_timings: None,
+                    confidence,
+                    video_confidence: None,
+                    audio_confidence: Some(confidence),
+                    match_type: MatchType::Audio,
+                };
+
+                // Validate that segment meets min_duration requirement
+                let segment_duration = segment.end_time - segment.start_time;
+                if debug_dupes {
+                    println!(
+                        "  Checking segment: {:.1}s - {:.1}s (duration: {:.1}s, min_duration: {:.1}s)",
+                        segment.start_time, segment.end_time, segment_duration, config.min_duration
+                    );
+                }
+                if segment_duration >= config.min_duration {
+                    if debug_dupes {
+                        println!(
+                            "\n🎵 Found audio segment: {:.1}s - {:.1}s (duration: {:.1}s)",
+                            segment.start_time, segment.end_time, segment_duration
+                        );
+                        println!("  Confidence: {:.1}%", segment.confidence * 100.0);
+                        println!("  Episodes: {}", segment.episode_list.join(", "));
+                    }
+
+                    common_segments.push(segment);
+                } else if debug_dupes {
+                    println!("  Segment too short, skipping");
+                }
+            }
+        }
+    }
+
+    // Apply deduplication and merge overlapping segments
+    let deduplicated_segments = deduplicate_similar_segments(common_segments);
+    let merged_segments = merge_overlapping_segments(deduplicated_segments);
+
+    // Sort by confidence (highest first)
+    let mut final_segments = merged_segments;
+    final_segments.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+    if debug_dupes {
+        println!("🎵 Detected {} audio segments", final_segments.len());
+    }
+
+    Ok(final_segments)
+}
+
+/// Combine audio and video segments, marking overlaps appropriately
+///
+/// This function merges audio and video segment detection results:
+/// - Segments that overlap in time are marked as AudioAndVideo
+/// - Non-overlapping audio segments remain as Audio
+/// - Non-overlapping video segments remain as Video
+///
+/// # Arguments
+/// * `video_segments` - Segments detected from video analysis
+/// * `audio_segments` - Segments detected from audio analysis
+///
+/// # Returns
+/// * `Vec<CommonSegment>` - Combined segments with appropriate match_type
+pub fn combine_audio_video_segments(
+    mut video_segments: Vec<CommonSegment>,
+    audio_segments: Vec<CommonSegment>,
+) -> Vec<CommonSegment> {
+    let mut combined = Vec::new();
+    let mut audio_used = vec![false; audio_segments.len()];
+
+    // Tolerance for considering segments as overlapping (in seconds)
+    const OVERLAP_TOLERANCE: f64 = 1.0;
+
+    // Process video segments and check for audio overlap
+    for mut video_seg in video_segments.drain(..) {
+        for (audio_idx, audio_seg) in audio_segments.iter().enumerate() {
+            if audio_used[audio_idx] {
+                continue;
+            }
+
+            // Check if segments overlap significantly
+            let overlap_start = video_seg.start_time.max(audio_seg.start_time);
+            let overlap_end = video_seg.end_time.min(audio_seg.end_time);
+            let overlap_duration = overlap_end - overlap_start;
+
+            let video_duration = video_seg.end_time - video_seg.start_time;
+            let audio_duration = audio_seg.end_time - audio_seg.start_time;
+            let min_duration = video_duration.min(audio_duration);
+
+            // If overlap is significant (>50% of smaller segment), consider them matching
+            if overlap_duration > min_duration * 0.5 || overlap_duration.abs() < OVERLAP_TOLERANCE {
+                // Mark as audio+video match
+                video_seg.match_type = MatchType::AudioAndVideo;
+
+                // Expand to cover both segments
+                video_seg.start_time = video_seg.start_time.min(audio_seg.start_time);
+                video_seg.end_time = video_seg.end_time.max(audio_seg.end_time);
+
+                // Merge episode lists
+                for episode in &audio_seg.episode_list {
+                    if !video_seg.episode_list.contains(episode) {
+                        video_seg.episode_list.push(episode.clone());
+                    }
+                }
+
+                // Set both confidence values
+                video_seg.audio_confidence = audio_seg.audio_confidence;
+                // video_confidence already set from video detection
+
+                // Overall confidence is average of both
+                let v_conf = video_seg.video_confidence.unwrap_or(0.0);
+                let a_conf = video_seg.audio_confidence.unwrap_or(0.0);
+                video_seg.confidence = (v_conf + a_conf) / 2.0;
+
+                audio_used[audio_idx] = true;
+                break;
+            }
+        }
+
+        combined.push(video_seg);
+    }
+
+    // Add remaining audio-only segments
+    for (audio_idx, audio_seg) in audio_segments.into_iter().enumerate() {
+        if !audio_used[audio_idx] {
+            combined.push(audio_seg);
+        }
+    }
+
+    // Sort by start time and merge any overlaps
+    combined.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+    merge_overlapping_segments(combined)
 }
 
 #[cfg(test)]
@@ -1369,19 +2176,31 @@ mod tests {
                 start_time: 0.0,
                 end_time: 10.0,
                 episode_list: vec!["ep1.mkv".to_string()],
+                episode_timings: None,
                 confidence: 0.8,
+                video_confidence: Some(0.8),
+                audio_confidence: None,
+                match_type: MatchType::Video,
             },
             CommonSegment {
                 start_time: 8.0,
                 end_time: 18.0,
                 episode_list: vec!["ep2.mkv".to_string()],
+                episode_timings: None,
                 confidence: 0.9,
+                video_confidence: Some(0.9),
+                audio_confidence: None,
+                match_type: MatchType::Video,
             },
             CommonSegment {
                 start_time: 25.0,
                 end_time: 35.0,
                 episode_list: vec!["ep3.mkv".to_string()],
+                episode_timings: None,
                 confidence: 0.7,
+                video_confidence: Some(0.7),
+                audio_confidence: None,
+                match_type: MatchType::Video,
             },
         ];
 

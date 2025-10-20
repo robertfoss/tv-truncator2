@@ -36,9 +36,13 @@ struct Args {
     #[arg(long, default_value = "0.75")]
     similarity_threshold: f64,
 
-    /// Algorithm to use for similarity detection
+    /// Algorithm to use for video similarity detection
     #[arg(long, value_enum, default_value = "current")]
     algorithm: tvt::similarity::SimilarityAlgorithm,
+
+    /// Algorithm to use for audio matching
+    #[arg(long, value_enum, default_value = "cross-correlation")]
+    audio_algorithm: tvt::AudioAlgorithm,
 
     /// Number of parallel workers
     #[arg(short, long)]
@@ -63,6 +67,10 @@ struct Args {
     /// Enable debug output for duplicate detection (shows similarity metrics)
     #[arg(long)]
     debug_dupes: bool,
+
+    /// Only detect audio segments (skip video analysis)
+    #[arg(long)]
+    audio_only: bool,
 }
 
 fn main() -> Result<()> {
@@ -93,6 +101,7 @@ fn main() -> Result<()> {
         similarity: args.similarity,
         similarity_threshold: args.similarity_threshold,
         similarity_algorithm: args.algorithm,
+        audio_algorithm: args.audio_algorithm,
         dry_run: args.dry_run,
         quick: args.quick,
         verbose: args.verbose,
@@ -101,6 +110,8 @@ fn main() -> Result<()> {
         parallel_workers: args
             .parallel
             .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1)),
+        enable_audio_matching: true, // Always enabled
+        audio_only: args.audio_only,
     };
 
     if config.verbose {
@@ -137,6 +148,7 @@ fn main() -> Result<()> {
 
     // Process files using state machine
     println!("\nStarting parallel processing with state machine...");
+    let config_clone = config.clone();
     let results = process_files_parallel(video_files, config)?;
 
     // Print summary
@@ -144,7 +156,7 @@ fn main() -> Result<()> {
     print_summary(&results);
 
     // Print segment analysis summary
-    print_segment_summary(&results);
+    print_segment_summary(&results, &config_clone);
 
     Ok(())
 }
@@ -176,7 +188,7 @@ fn find_video_files(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Print a summary of detected identical segments
-fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor]) {
+fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor], config: &Config) {
     // Collect all common segments from all processors
     let mut all_segments = Vec::new();
     for processor in processors {
@@ -198,6 +210,11 @@ fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor]) {
     });
 
     println!("\n=== Segment Analysis Summary ===");
+    if config.audio_only {
+        println!("(Audio-only mode)");
+    } else if config.enable_audio_matching {
+        println!("(Combined audio+video matching)");
+    }
     println!(
         "Found {} identical segment(s) across {} file(s):",
         all_segments.len(),
@@ -207,18 +224,66 @@ fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor]) {
 
     for (i, segment) in all_segments.iter().enumerate() {
         let duration = segment.end_time - segment.start_time;
-        let confidence_percent = (segment.confidence * 100.0) as u8;
 
         println!("Segment {}:", i + 1);
         println!(
-            "  Time: {:.2}s - {:.2}s (duration: {:.2}s)",
-            segment.start_time, segment.end_time, duration
+            "  Time: {} - {} (duration: {})",
+            tvt::format_time(segment.start_time),
+            tvt::format_time(segment.end_time),
+            tvt::format_time(duration)
         );
-        println!("  Confidence: {}%", confidence_percent);
+        println!("  Match type: {}", segment.match_type);
+        
+        // Print separate confidence values
+        match segment.match_type {
+            tvt::segment_detector::MatchType::Video => {
+                if let Some(v_conf) = segment.video_confidence {
+                    println!("  Video confidence: {:.0}%", v_conf * 100.0);
+                }
+            }
+            tvt::segment_detector::MatchType::Audio => {
+                if let Some(a_conf) = segment.audio_confidence {
+                    println!("  Audio confidence: {:.0}%", a_conf * 100.0);
+                }
+            }
+            tvt::segment_detector::MatchType::AudioAndVideo => {
+                if let Some(v_conf) = segment.video_confidence {
+                    println!("  Video confidence: {:.0}%", v_conf * 100.0);
+                }
+                if let Some(a_conf) = segment.audio_confidence {
+                    println!("  Audio confidence: {:.0}%", a_conf * 100.0);
+                }
+            }
+        }
+        
         println!("  Found in {} episode(s):", segment.episode_list.len());
 
-        for episode_name in &segment.episode_list {
-            println!("    - {}", episode_name);
+        // Show per-episode timing if available (for time-shifted segments)
+        // Otherwise just show file names with segment timing
+        if let Some(ref timings) = segment.episode_timings {
+            for timing in timings {
+                let offset = timing.start_time - segment.start_time;
+                if offset.abs() < 0.5 {
+                    println!("    - {} at {}-{}", 
+                        timing.episode_name,
+                        tvt::format_time(timing.start_time),
+                        tvt::format_time(timing.end_time));
+                } else {
+                    println!("    - {} at {}-{} (time shift: {:+.1}s)", 
+                        timing.episode_name,
+                        tvt::format_time(timing.start_time),
+                        tvt::format_time(timing.end_time),
+                        offset);
+                }
+            }
+        } else {
+            // No per-episode timing, show files with segment's reference timing
+            for episode_name in &segment.episode_list {
+                println!("    - {} at {}-{}", 
+                    episode_name,
+                    tvt::format_time(segment.start_time),
+                    tvt::format_time(segment.end_time));
+            }
         }
         println!();
     }

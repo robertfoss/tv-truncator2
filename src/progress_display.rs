@@ -127,18 +127,24 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
         ProcessingState::Probed { frames_total } => {
             format!("[{}] {}: {}", frames_total, state_info, filename)
         }
-        ProcessingState::Extracting {
+        ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
+        } | ProcessingState::ExtractingAudio {
+            samples_processed: frames_processed,
+            samples_total: frames_total,
         } => {
             format!(
                 "[{}/{}] {}: {}",
                 frames_processed, frames_total, state_info, filename
             )
         }
-        ProcessingState::Extracted {
+        ProcessingState::ExtractedVideo {
             frames_processed,
             frames_total,
+        } | ProcessingState::ExtractedAudio {
+            samples_processed: frames_processed,
+            samples_total: frames_total,
         } => {
             format!(
                 "[{}/{}] {}: {}",
@@ -206,17 +212,23 @@ fn get_progress_info_from_state(state: &ProcessingState) -> (u64, u64) {
             (pos, 100)
         }
         ProcessingState::Probed { .. } => (100, 100),
-        ProcessingState::Extracting {
+        ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
+        } | ProcessingState::ExtractingAudio {
+            samples_processed: frames_processed,
+            samples_total: frames_total,
         } => {
             let total = *frames_total as u64;
             let pos = *frames_processed as u64;
             (pos, total.max(1))
         }
-        ProcessingState::Extracted {
+        ProcessingState::ExtractedVideo {
             frames_processed,
             frames_total,
+        } | ProcessingState::ExtractedAudio {
+            samples_processed: frames_processed,
+            samples_total: frames_total,
         } => {
             let total = *frames_total as u64;
             let pos = *frames_processed as u64;
@@ -258,17 +270,23 @@ fn get_progress_info(processor: &FileProcessor) -> (u64, u64) {
             (pos, 100)
         }
         ProcessingState::Probed { .. } => (100, 100),
-        ProcessingState::Extracting {
+        ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
+        } | ProcessingState::ExtractingAudio {
+            samples_processed: frames_processed,
+            samples_total: frames_total,
         } => {
             let total = *frames_total as u64;
             let pos = *frames_processed as u64;
             (pos, total.max(1)) // Avoid division by zero
         }
-        ProcessingState::Extracted {
+        ProcessingState::ExtractedVideo {
             frames_processed,
             frames_total,
+        } | ProcessingState::ExtractedAudio {
+            samples_processed: frames_processed,
+            samples_total: frames_total,
         } => {
             let total = *frames_total as u64;
             let pos = *frames_processed as u64;
@@ -317,11 +335,16 @@ fn format_state_info_from_state(state: &ProcessingState) -> String {
         ProcessingState::Waiting => "Waiting".to_string(),
         ProcessingState::Probing { progress } => format!("Probing ({:.0}%)", progress * 100.0),
         ProcessingState::Probed { .. } => "Probed".to_string(),
-        ProcessingState::Extracting {
+        ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
-        } => format!("Extracting {}/{}", frames_processed, frames_total),
-        ProcessingState::Extracted { .. } => "Extracted".to_string(),
+        } => format!("Extracting Video {}/{}", frames_processed, frames_total),
+        ProcessingState::ExtractingAudio {
+            samples_processed,
+            samples_total,
+        } => format!("Extracting Audio {}/{}", samples_processed, samples_total),
+        ProcessingState::ExtractedVideo { .. } => "Video Extracted".to_string(),
+        ProcessingState::ExtractedAudio { .. } => "Audio Extracted".to_string(),
         ProcessingState::Analyzing {
             frames_analyzed,
             frames_total,
@@ -341,8 +364,10 @@ fn format_state_info(processor: &FileProcessor) -> String {
         ProcessingState::Waiting => "Waiting".to_string(),
         ProcessingState::Probing { .. } => "Probing".to_string(),
         ProcessingState::Probed { .. } => "Probed".to_string(),
-        ProcessingState::Extracting { .. } => "Extracting".to_string(),
-        ProcessingState::Extracted { .. } => "Extracted".to_string(),
+        ProcessingState::ExtractingVideo { .. } => "Extracting Video".to_string(),
+        ProcessingState::ExtractedVideo { .. } => "Video Extracted".to_string(),
+        ProcessingState::ExtractingAudio { .. } => "Extracting Audio".to_string(),
+        ProcessingState::ExtractedAudio { .. } => "Audio Extracted".to_string(),
         ProcessingState::Analyzing { .. } => "Analyzing".to_string(),
         ProcessingState::Analyzed { .. } => "Analyzed".to_string(),
         ProcessingState::FindingRepeated { .. } => "Finding Repeated".to_string(),
@@ -423,11 +448,11 @@ mod tests {
         processor.transition_to(ProcessingState::Probed { frames_total: 100 });
         assert_eq!(format_state_info(&processor), "Probed");
 
-        processor.transition_to(ProcessingState::Extracting {
+        processor.transition_to(ProcessingState::ExtractingVideo {
             frames_processed: 5,
             frames_total: 20,
         });
-        assert_eq!(format_state_info(&processor), "Extracting");
+        assert_eq!(format_state_info(&processor), "Extracting Video");
 
         processor.transition_to(ProcessingState::Analyzing {
             frames_analyzed: 3,
@@ -453,7 +478,7 @@ mod tests {
         processor.transition_to(ProcessingState::Probing { progress: 0.5 });
         assert_eq!(get_progress_info(&processor), (50, 100));
 
-        processor.transition_to(ProcessingState::Extracting {
+        processor.transition_to(ProcessingState::ExtractingVideo {
             frames_processed: 25,
             frames_total: 100,
         });

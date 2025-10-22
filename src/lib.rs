@@ -7,9 +7,17 @@
 //! - Cut video segments while preserving synchronization
 
 pub mod analyzer;
+pub mod audio_chromaprint;
+pub mod audio_comparison;
 pub mod audio_correlation;
+pub mod audio_energy_bands;
 pub mod audio_extractor;
+pub mod audio_features;
+pub mod audio_fingerprint;
 pub mod audio_hasher;
+pub mod audio_mfcc;
+pub mod audio_segment_utils;
+pub mod audio_spectral_v2;
 pub mod gstreamer_cutter;
 pub mod gstreamer_extractor_v2;
 pub mod hasher;
@@ -40,10 +48,25 @@ pub fn format_time(seconds: f64) -> String {
 /// Audio matching algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AudioAlgorithm {
-    /// Spectral hash matching (fast, exact matches)
+    /// Chromaprint-style landmark fingerprinting (robust, time-shift capable)
+    Chromaprint,
+    /// MFCC-based matching with DTW (robust to encoding, good for speech/music)
+    Mfcc,
+    /// Improved spectral hash v2 (balanced speed/accuracy)
+    SpectralV2,
+    /// Energy band pattern matching (simple, effective for theme songs)
+    EnergyBands,
+    
+    // Legacy algorithms (deprecated, kept for compatibility)
+    /// Legacy spectral hash matching (deprecated, use SpectralV2)
+    #[value(name = "spectral-hash")]
     SpectralHash,
-    /// Cross-correlation matching (robust to phase shifts and encoding)
+    /// Legacy cross-correlation (deprecated, use Chromaprint)
+    #[value(name = "cross-correlation")]
     CrossCorrelation,
+    /// Legacy fingerprint (deprecated, use Chromaprint)
+    #[value(name = "fingerprint")]
+    Fingerprint,
 }
 
 /// Configuration for the TVT application
@@ -77,7 +100,7 @@ impl Default for Config {
             similarity: 90,
             similarity_threshold: 0.75, // Default 75% similarity
             similarity_algorithm: crate::similarity::SimilarityAlgorithm::Current,
-            audio_algorithm: AudioAlgorithm::CrossCorrelation, // More robust for encoded audio
+            audio_algorithm: AudioAlgorithm::Chromaprint, // Most robust for encoded audio
             dry_run: false,
             quick: false,
             verbose: false,

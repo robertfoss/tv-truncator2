@@ -540,29 +540,27 @@ fn detect_time_shifted_segments(
         // This filters out spurious short matches while allowing real segments
         merged_regions.retain(|(s, e, _)| (e - s) >= 20.0);
         
-        // For potential ending segments (>1300s = 21.6min), ensure 70s ending
-        // Anime episodes typically have exactly 70s endings
+        // Trim opening and ending segments to proper durations
         for (start, end, _conf) in &mut merged_regions {
             let duration = *end - *start;
             
-            // Check if this might be an ending segment (within last 2 minutes of episode)
+            // Check if this is an opening segment (starts near beginning)
+            let might_be_opening = *start < 30.0 && *end < 500.0;
+            
+            // Trim opening to 90s (1:30) - standard anime opening theme duration
+            if might_be_opening && duration > 90.0 {
+                *end = *start + 90.0;
+            }
+            
+            // Check if this might be an ending segment (within last 3 minutes of episode)
             let might_be_ending = *start > 1300.0 && *end > 1400.0;
             
-            // Trim to exactly 70s ending
-            if might_be_ending {
-                if duration > 70.0 {
-                    // Trim the start to be exactly 70s before the end
-                    *start = *end - 70.0;
-                } else if duration < 70.0 && duration > 50.0 {
-                    // Slightly short, but still likely an ending
-                    // Keep as-is (might be a shorter variant)
-                } else if duration < 50.0 {
-                    // Too short for a typical ending, might be spurious
-                    // Mark for removal by setting confidence to 0
-                    if duration < 40.0 {
-                        *start = *end; // Mark as empty (will be filtered)
-                    }
-                }
+            // Trim ending to 70s - standard anime ending credits duration
+            if might_be_ending && duration > 70.0 {
+                *start = *end - 70.0;
+            } else if might_be_ending && duration < 40.0 {
+                // Too short for a typical ending, might be spurious
+                *start = *end; // Mark as empty (will be filtered)
             }
         }
         
@@ -2038,9 +2036,9 @@ pub fn combine_audio_video_segments(
                 // Mark as audio+video match
                 video_seg.match_type = MatchType::AudioAndVideo;
 
-                // Expand to cover both segments
-                video_seg.start_time = video_seg.start_time.min(audio_seg.start_time);
-                video_seg.end_time = video_seg.end_time.max(audio_seg.end_time);
+                // Use video boundaries as they are more precise than audio
+                // Audio detection tends to be wider/looser than video
+                // Keep video_seg boundaries unchanged
 
                 // Merge episode lists
                 for episode in &audio_seg.episode_list {

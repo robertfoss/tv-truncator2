@@ -21,6 +21,10 @@ pub struct AudioFrame {
 pub struct EpisodeAudio {
     pub episode_path: std::path::PathBuf,
     pub audio_frames: Vec<AudioFrame>,
+    /// Raw audio samples (mono, 22050 Hz) for advanced algorithms
+    pub raw_samples: Vec<f32>,
+    /// Sample rate of raw audio
+    pub sample_rate: f32,
 }
 
 /// Extract audio samples from a video file

@@ -41,7 +41,7 @@ struct Args {
     algorithm: tvt::similarity::SimilarityAlgorithm,
 
     /// Algorithm to use for audio matching
-    #[arg(long, value_enum, default_value = "cross-correlation")]
+    #[arg(long, value_enum, default_value = "fingerprint")]
     audio_algorithm: tvt::AudioAlgorithm,
 
     /// Number of parallel workers

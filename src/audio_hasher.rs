@@ -6,8 +6,6 @@
 use crate::audio_extractor::AudioFrame;
 use crate::Result;
 use rustfft::{FftPlanner, num_complex::Complex};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Window size for FFT analysis (power of 2 for efficiency)
 /// Using 8192 for more robust matching with encoded audio
@@ -149,37 +147,39 @@ pub fn extract_spectral_features(samples: &[f32], sample_rate: f32) -> Result<Sp
 /// # Returns
 /// * `u64` - 64-bit perceptual hash
 pub fn generate_audio_hash(features: &SpectralFeatures) -> u64 {
-    // Balanced hash: robust to encoding differences but discriminative enough
-    // Uses coarse quantization with more bits of information
+    // Ultra-coarse hash optimized for matching theme songs/credits across encoded episodes
+    // Prioritizes robustness over precision - captures general audio character only
     
-    // Quantize centroid to 16 bands (1kHz each up to 16kHz)
-    let centroid_band = ((features.centroid / 1000.0).round() as u64).min(15);
-    
-    // Quantize rolloff to 16 bands (1kHz each)
-    let rolloff_band = ((features.rolloff / 1000.0).round() as u64).min(15);
-    
-    // Quantize energy to 8 levels (3 bits)
-    let energy_level = ((features.energy * 0.5).round() as u64).min(7);
-    
-    // Use top 2 dominant bins, grouped into bands of 30
-    let bin1 = if !features.dominant_bins.is_empty() {
-        ((features.dominant_bins[0] / 30) as u64).min(31)
+    // Classify frequency content very coarsely (low, mid, high)
+    let freq_class = if features.centroid < 1500.0 {
+        0u64  // Low frequency dominant (speech/bass)
+    } else if features.centroid < 4000.0 {
+        1u64  // Mid frequency (mixed content)
     } else {
-        0
-    };
-    let bin2 = if features.dominant_bins.len() > 1 {
-        ((features.dominant_bins[1] / 30) as u64).min(31)
-    } else {
-        0
+        2u64  // High frequency (effects/cymbals)
     };
     
-    // Combine into hash: 4+4+3+5+5 = 21 bits (room for 2^21 = 2M combinations)
-    // This balances robustness (coarse quantization) with discrimination
-    (centroid_band << 48)
-        | (rolloff_band << 40)
-        | (energy_level << 32)
-        | (bin1 << 16)
-        | bin2
+    // Energy in 4 very broad levels
+    let energy_class = if features.energy < 3.0 {
+        0u64  // Very quiet
+    } else if features.energy < 8.0 {
+        1u64  // Quiet
+    } else if features.energy < 15.0 {
+        2u64  // Medium/Loud
+    } else {
+        3u64  // Very loud
+    };
+    
+    // Check for bass presence (important for music detection)
+    let has_bass = if features.dominant_bins.iter().any(|&b| b < 50) {
+        1u64
+    } else {
+        0u64
+    };
+    
+    // Combine into minimal hash (only ~4 bits of information)
+    // This will match perceptually similar audio despite encoding differences
+    (freq_class << 4) | (energy_class << 2) | has_bass
 }
 
 /// Process audio samples and extract audio frames with spectral hashes

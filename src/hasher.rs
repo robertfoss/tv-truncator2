@@ -47,7 +47,7 @@ impl RollingHash {
         } else {
             // Window is full, do rolling hash
             // Remove the oldest value (at position 0)
-            let old_value = self.window[0];
+            let _old_value = self.window[0];
 
             // Shift all values left
             for i in 0..self.window_size - 1 {

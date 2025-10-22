@@ -350,7 +350,9 @@ fn format_state_info_from_state(state: &ProcessingState) -> String {
             frames_total,
         } => format!("Analyzing {}/{}", frames_analyzed, frames_total),
         ProcessingState::Analyzed { .. } => "Analyzed".to_string(),
-        ProcessingState::FindingRepeated { .. } => "Finding Duplicates".to_string(),
+        ProcessingState::FindingRepeated { progress } => {
+            format!("Finding Duplicates ({:.0}%)", progress * 100.0)
+        }
         ProcessingState::Cutting { progress } => format!("Cutting ({:.0}%)", progress * 100.0),
         ProcessingState::Done { .. } => "Done".to_string(),
         ProcessingState::Failed { error } => format!("Failed: {}", error),

@@ -2,10 +2,15 @@
 
 use crate::analyzer::{get_video_info, EpisodeFrames, VideoInfo};
 use crate::audio_extractor::{extract_audio_samples, EpisodeAudio};
+use crate::audio_chromaprint::detect_audio_segments_chromaprint;
+use crate::audio_correlation::detect_audio_segments_correlation;
+use crate::audio_energy_bands::detect_audio_segments_energy_bands;
+use crate::audio_fingerprint::detect_audio_segments_fingerprint;
 use crate::audio_hasher::process_audio_samples;
+use crate::audio_mfcc::detect_audio_segments_mfcc;
+use crate::audio_spectral_v2::detect_audio_segments_spectral_v2;
 use crate::gstreamer_extractor_v2::{extract_frames_gstreamer_v2, get_video_duration_gstreamer};
 use crate::progress_display::spawn_progress_display;
-use crate::audio_correlation::detect_audio_segments_correlation;
 use crate::segment_detector::{
     combine_audio_video_segments, detect_audio_segments, detect_common_segments,
     merge_overlapping_segments,
@@ -409,10 +414,12 @@ fn extract_audio_single_file(
     // Process audio samples into audio frames with spectral hashes
     let audio_frames = process_audio_samples(&audio_samples, sample_rate_hz as f32, frame_rate)?;
 
-    // Store audio frames in processor
+    // Store audio frames in processor (including raw samples for advanced algorithms)
     let episode_audio = EpisodeAudio {
         episode_path: file_path.clone(),
         audio_frames,
+        raw_samples: audio_samples.clone(), // Keep raw samples for chromaprint/MFCC/etc
+        sample_rate: sample_rate_hz as f32,
     };
 
     if config.debug {
@@ -570,53 +577,168 @@ fn find_repeated_segments(
         }
     }
 
+    // Update progress to 10% (starting segment detection)
+    {
+        let mut processors_guard = processors_arc.lock().unwrap();
+        for processor in processors_guard.iter_mut() {
+            if !processor.state.is_failed() {
+                processor.update_finding_repeated(0.1);
+            }
+        }
+    }
+
     // Detect segments based on configuration
     let final_segments = if config.audio_only {
         // Audio-only mode
         if all_audio.is_empty() {
             Vec::new()
         } else {
+            // Update progress to 30% (audio detection starting)
+            {
+                let mut processors_guard = processors_arc.lock().unwrap();
+                for processor in processors_guard.iter_mut() {
+                    if !processor.state.is_failed() {
+                        processor.update_finding_repeated(0.3);
+                    }
+                }
+            }
+            
             let audio_segments = match config.audio_algorithm {
+                crate::AudioAlgorithm::Chromaprint => {
+                    detect_audio_segments_chromaprint(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::Mfcc => {
+                    detect_audio_segments_mfcc(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::SpectralV2 => {
+                    detect_audio_segments_spectral_v2(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::EnergyBands => {
+                    detect_audio_segments_energy_bands(&all_audio, config, config.debug_dupes)?
+                }
+                // Legacy algorithms
                 crate::AudioAlgorithm::SpectralHash => {
                     detect_audio_segments(&all_audio, config, config.debug_dupes)?
                 }
                 crate::AudioAlgorithm::CrossCorrelation => {
                     detect_audio_segments_correlation(&all_audio, config, config.debug_dupes)?
                 }
+                crate::AudioAlgorithm::Fingerprint => {
+                    detect_audio_segments_fingerprint(&all_audio, config, config.debug_dupes)?
+                }
             };
+            // Update progress to 80% (audio detection complete)
+            {
+                let mut processors_guard = processors_arc.lock().unwrap();
+                for processor in processors_guard.iter_mut() {
+                    if !processor.state.is_failed() {
+                        processor.update_finding_repeated(0.8);
+                    }
+                }
+            }
+            
             merge_overlapping_segments(audio_segments)
         }
     } else if config.enable_audio_matching {
         // Combined audio + video mode
+        
+        // Update progress to 20% (video detection starting)
+        {
+            let mut processors_guard = processors_arc.lock().unwrap();
+            for processor in processors_guard.iter_mut() {
+                if !processor.state.is_failed() {
+                    processor.update_finding_repeated(0.2);
+                }
+            }
+        }
+        
         let video_segments = if all_frames.is_empty() {
             Vec::new()
         } else {
             detect_common_segments(&all_frames, config, config.debug_dupes)?
         };
         
+        // Update progress to 50% (audio detection starting)
+        {
+            let mut processors_guard = processors_arc.lock().unwrap();
+            for processor in processors_guard.iter_mut() {
+                if !processor.state.is_failed() {
+                    processor.update_finding_repeated(0.5);
+                }
+            }
+        }
+        
         let audio_segments = if all_audio.is_empty() {
             Vec::new()
         } else {
             // Use selected audio algorithm
             match config.audio_algorithm {
+                crate::AudioAlgorithm::Chromaprint => {
+                    detect_audio_segments_chromaprint(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::Mfcc => {
+                    detect_audio_segments_mfcc(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::SpectralV2 => {
+                    detect_audio_segments_spectral_v2(&all_audio, config, config.debug_dupes)?
+                }
+                crate::AudioAlgorithm::EnergyBands => {
+                    detect_audio_segments_energy_bands(&all_audio, config, config.debug_dupes)?
+                }
+                // Legacy algorithms
                 crate::AudioAlgorithm::SpectralHash => {
                     detect_audio_segments(&all_audio, config, config.debug_dupes)?
                 }
                 crate::AudioAlgorithm::CrossCorrelation => {
                     detect_audio_segments_correlation(&all_audio, config, config.debug_dupes)?
                 }
+                crate::AudioAlgorithm::Fingerprint => {
+                    detect_audio_segments_fingerprint(&all_audio, config, config.debug_dupes)?
+                }
             }
         };
+
+        // Update progress to 80% (merging segments)
+        {
+            let mut processors_guard = processors_arc.lock().unwrap();
+            for processor in processors_guard.iter_mut() {
+                if !processor.state.is_failed() {
+                    processor.update_finding_repeated(0.8);
+                }
+            }
+        }
 
         // Combine and merge
         let combined = combine_audio_video_segments(video_segments, audio_segments);
         merge_overlapping_segments(combined)
     } else {
         // Video-only mode (default)
+        
+        // Update progress to 30% (video detection starting)
+        {
+            let mut processors_guard = processors_arc.lock().unwrap();
+            for processor in processors_guard.iter_mut() {
+                if !processor.state.is_failed() {
+                    processor.update_finding_repeated(0.3);
+                }
+            }
+        }
+        
         if all_frames.is_empty() {
             Vec::new()
         } else {
             let video_segments = detect_common_segments(&all_frames, config, config.debug_dupes)?;
+            
+            // Update progress to 80% (merging)
+            {
+                let mut processors_guard = processors_arc.lock().unwrap();
+                for processor in processors_guard.iter_mut() {
+                    if !processor.state.is_failed() {
+                        processor.update_finding_repeated(0.8);
+                    }
+                }
+            }
+            
             merge_overlapping_segments(video_segments)
         }
     };

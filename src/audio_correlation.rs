@@ -6,17 +6,15 @@
 use crate::audio_extractor::EpisodeAudio;
 use crate::segment_detector::{CommonSegment, MatchType};
 use crate::Result;
-use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
-use std::collections::HashMap;
 
 /// Chunk size for cross-correlation analysis (in audio frames)
 /// Larger chunks are more robust but slower
+#[allow(dead_code)]
 const CHUNK_SIZE: usize = 30; // 30 seconds at 1 fps
 
 /// Correlation threshold for considering segments as matching
 /// Lowered to handle encoding differences in real-world videos
-const CORRELATION_THRESHOLD: f64 = 0.70; // 70% correlation
+const CORRELATION_THRESHOLD: f64 = 0.50; // 50% correlation (real-world encoded audio varies significantly)
 
 /// Find matching audio segments using cross-correlation
 ///
@@ -181,12 +179,15 @@ fn find_matching_segments_between_episodes(
                 // Skip ahead to avoid overlapping matches
                 pos1 = chunk1_end;
                 continue;
-            } else if debug_dupes && correlation >= 0.5 {
+            } else if debug_dupes && correlation >= 0.3 {
                 let start1 = ep1.audio_frames[pos1].timestamp;
-                println!(
-                    "    Below threshold (0.70): ep1 {:.1}s, corr={:.3}",
-                    start1, correlation
-                );
+                // Print correlations in key areas (opening and ending)
+                if start1 < 120.0 || (start1 > 1300.0 && start1 < 1420.0) {
+                    println!(
+                        "    Below threshold (0.50): ep1 {:.1}s, corr={:.3}",
+                        start1, correlation
+                    );
+                }
             }
         }
 

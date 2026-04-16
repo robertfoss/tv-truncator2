@@ -240,4 +240,4 @@ cargo test -- --nocapture
 
 ## Contributing
 
-[Add contribution guidelines here]
+Start with [docs/IC_ONBOARDING.md](docs/IC_ONBOARDING.md) for workspace path, toolchain, tests, and day-1 checklist (founding IC / Paperclip execution).

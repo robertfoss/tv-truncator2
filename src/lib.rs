@@ -6,6 +6,8 @@
 //! - Detect common segments across multiple episodes
 //! - Cut video segments while preserving synchronization
 
+pub mod accuracy;
+pub mod accuracy_store;
 pub mod analyzer;
 pub mod audio_chromaprint;
 pub mod audio_comparison;

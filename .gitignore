@@ -9,3 +9,6 @@ tests/samples/**
 tests/samples/synthetic/downscaled_2file/**/*.mkv
 tests/samples/synthetic/downscaled_2file/truncated/
 tests/samples/synthetic/downscaled_2file/truncated_test/
+
+# Local accuracy benchmark DB (MEMA-26); schema is defined in accuracy_store.rs.
+tests/fixtures/accuracy_runs.sqlite

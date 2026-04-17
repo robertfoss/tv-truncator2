@@ -3,6 +3,7 @@
 //! Runs all audio algorithms on the same test data and generates
 //! detailed comparison reports with precision, recall, F1, and performance metrics.
 
+use crate::accuracy::evaluate_detection_accuracy;
 use crate::audio_chromaprint::detect_audio_segments_chromaprint;
 use crate::audio_energy_bands::detect_audio_segments_energy_bands;
 use crate::audio_extractor::EpisodeAudio;
@@ -33,13 +34,8 @@ pub struct ComparisonMetrics {
     pub segments_found: usize,
 }
 
-/// Expected segment for validation
-#[derive(Debug, Clone)]
-pub struct ExpectedSegment {
-    pub start_time: f64,
-    pub end_time: f64,
-    pub min_episodes: usize,
-}
+/// Expected segment for validation (shared with [`crate::accuracy::ExpectedFixtureSegment`]).
+pub type ExpectedSegment = crate::accuracy::ExpectedFixtureSegment;
 
 /// Run all algorithms and compare results
 pub fn compare_all_algorithms(
@@ -161,147 +157,16 @@ fn calculate_metrics(
         }
     }
 
-    let (precision, recall, f1_score) =
-        calculate_precision_recall(&result.segments, expected_segments, debug);
-
-    let timing_accuracy_ms = calculate_timing_accuracy(&result.segments, expected_segments);
+    let m = evaluate_detection_accuracy(&result.segments, expected_segments, debug);
 
     ComparisonMetrics {
         algorithm: result.algorithm,
-        precision,
-        recall,
-        f1_score,
-        timing_accuracy_ms,
+        precision: m.precision,
+        recall: m.recall,
+        f1_score: m.f1_score,
+        timing_accuracy_ms: m.timing_mean_abs_error_ms,
         execution_time_ms: result.execution_time_ms,
         segments_found: result.segments.len(),
-    }
-}
-
-/// Calculate precision, recall, and F1 score
-fn calculate_precision_recall(
-    detected: &[CommonSegment],
-    expected: &[ExpectedSegment],
-    debug: bool,
-) -> (f64, f64, f64) {
-    if expected.is_empty() {
-        return (1.0, 1.0, 1.0);
-    }
-
-    // Count true positives, false positives, false negatives
-    let mut true_positives = 0;
-    let mut matched_expected = vec![false; expected.len()];
-
-    for detected_seg in detected {
-        let mut matched = false;
-
-        for (i, expected_seg) in expected.iter().enumerate() {
-            if matched_expected[i] {
-                continue;
-            }
-
-            // Check if detected segment overlaps with expected
-            let overlap_start = detected_seg.start_time.max(expected_seg.start_time);
-            let overlap_end = detected_seg.end_time.min(expected_seg.end_time);
-            let overlap_duration = (overlap_end - overlap_start).max(0.0);
-
-            let expected_duration = expected_seg.end_time - expected_seg.start_time;
-            let detected_duration = detected_seg.end_time - detected_seg.start_time;
-            let min_duration = expected_duration.min(detected_duration);
-
-            // Consider it a match if overlap is > 50% of the smaller segment
-            if overlap_duration > min_duration * 0.5 {
-                // Also check episode count
-                if detected_seg.episode_list.len() >= expected_seg.min_episodes {
-                    true_positives += 1;
-                    matched_expected[i] = true;
-                    matched = true;
-                    if debug {
-                        println!(
-                            "    ✓ Match: {:.1}s-{:.1}s ({} episodes)",
-                            detected_seg.start_time,
-                            detected_seg.end_time,
-                            detected_seg.episode_list.len()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !matched && debug {
-            println!(
-                "    ✗ False positive: {:.1}s-{:.1}s ({} episodes)",
-                detected_seg.start_time,
-                detected_seg.end_time,
-                detected_seg.episode_list.len()
-            );
-        }
-    }
-
-    let false_positives = detected.len().saturating_sub(true_positives);
-    let false_negatives = matched_expected.iter().filter(|&&m| !m).count();
-
-    let precision = if detected.is_empty() {
-        if expected.is_empty() {
-            1.0
-        } else {
-            0.0
-        }
-    } else {
-        true_positives as f64 / detected.len() as f64
-    };
-
-    let recall = if expected.is_empty() {
-        1.0
-    } else {
-        true_positives as f64 / expected.len() as f64
-    };
-
-    let f1_score = if precision + recall > 0.0 {
-        2.0 * (precision * recall) / (precision + recall)
-    } else {
-        0.0
-    };
-
-    if debug {
-        println!(
-            "    Metrics: P={:.2} R={:.2} F1={:.2} (TP={} FP={} FN={})",
-            precision, recall, f1_score, true_positives, false_positives, false_negatives
-        );
-    }
-
-    (precision, recall, f1_score)
-}
-
-/// Calculate average timing accuracy (how close detected times are to expected)
-fn calculate_timing_accuracy(detected: &[CommonSegment], expected: &[ExpectedSegment]) -> f64 {
-    let mut total_error = 0.0;
-    let mut count = 0;
-
-    for detected_seg in detected {
-        // Find best matching expected segment
-        let mut best_error = f64::INFINITY;
-
-        for expected_seg in expected {
-            let start_error = (detected_seg.start_time - expected_seg.start_time).abs();
-            let end_error = (detected_seg.end_time - expected_seg.end_time).abs();
-            let avg_error = (start_error + end_error) / 2.0;
-
-            if avg_error < best_error {
-                best_error = avg_error;
-            }
-        }
-
-        if best_error < f64::INFINITY {
-            total_error += best_error;
-            count += 1;
-        }
-    }
-
-    if count > 0 {
-        (total_error / count as f64) * 1000.0 // Convert to milliseconds
-    } else {
-        0.0
     }
 }
 
@@ -358,30 +223,5 @@ pub fn print_comparison_report(metrics: &[ComparisonMetrics]) {
             "🎯 Most Accurate Timing: {:?} ({:.1}ms error)",
             best_timing.algorithm, best_timing.timing_accuracy_ms
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_precision_recall_perfect() {
-        let detected = vec![];
-        let expected = vec![];
-
-        let (precision, recall, f1) = calculate_precision_recall(&detected, &expected, false);
-        assert_eq!(precision, 1.0);
-        assert_eq!(recall, 1.0);
-        assert_eq!(f1, 1.0);
-    }
-
-    #[test]
-    fn test_timing_accuracy_empty() {
-        let detected = vec![];
-        let expected = vec![];
-
-        let accuracy = calculate_timing_accuracy(&detected, &expected);
-        assert_eq!(accuracy, 0.0);
     }
 }

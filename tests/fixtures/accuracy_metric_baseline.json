@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "description": "Locked outputs for evaluate_detection_accuracy (MEMA-26). Update when intentionally changing overlap rules.",
+  "cases": [
+    {
+      "id": "both_empty",
+      "detected": [],
+      "expected": [],
+      "want_precision": 1.0,
+      "want_recall": 1.0,
+      "want_f1": 1.0,
+      "want_timing_ms": 0.0
+    },
+    {
+      "id": "legacy_no_expectations",
+      "detected": [
+        { "start": 0.0, "end": 5.0, "episodes": 2 }
+      ],
+      "expected": [],
+      "want_precision": 1.0,
+      "want_recall": 1.0,
+      "want_f1": 1.0,
+      "want_timing_ms": 0.0
+    },
+    {
+      "id": "miss_all",
+      "detected": [
+        { "start": 100.0, "end": 110.0, "episodes": 2 }
+      ],
+      "expected": [
+        { "start": 0.0, "end": 10.0, "min_episodes": 2 }
+      ],
+      "want_precision": 0.0,
+      "want_recall": 0.0,
+      "want_f1": 0.0,
+      "want_timing_ms": 100000.0
+    },
+    {
+      "id": "perfect_align",
+      "detected": [
+        { "start": 2.0, "end": 12.0, "episodes": 3 }
+      ],
+      "expected": [
+        { "start": 2.0, "end": 12.0, "min_episodes": 3 }
+      ],
+      "want_precision": 1.0,
+      "want_recall": 1.0,
+      "want_f1": 1.0,
+      "want_timing_ms": 0.0
+    }
+  ]
+}

@@ -68,6 +68,10 @@ cargo build --release
 cargo build --release --no-default-features --features ffmpeg
 ```
 
+## Contributing
+
+See [docs/GIT_COMMIT_POLICY.md](docs/GIT_COMMIT_POLICY.md) for commit message conventions, scope expectations, and pre-push checks.
+
 ## Usage
 
 ### Basic Usage

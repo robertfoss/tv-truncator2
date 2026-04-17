@@ -1,5 +1,9 @@
 # Cursor AI Rules for TVT Project
 
+## Git commits (mandatory)
+
+- For any change under `src/`, `tests/`, or `tests/samples/` (or other tracked sample/fixture trees), follow **`docs/GIT_COMMIT_POLICY.md`** end-to-end: subject/body, coherent commits, no secrets, `cargo fmt` / `cargo clippy` / `cargo test` before push, and the Paperclip **`Co-Authored-By: Paperclip <noreply@paperclip.ing>`** trailer when the commit is produced by an automated Paperclip agent run.
+
 ## Testing Enforcement
 - ALWAYS run `cargo test` after making any code changes
 - Write tests for every new feature before implementing it (TDD approach)

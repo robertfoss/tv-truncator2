@@ -26,6 +26,12 @@ git pull --ff-only
 
 Use the same remote and branch your team agrees on (default `main` / `master` as applicable).
 
+## Git commits (required)
+
+**Team rule:** any commit that touches **`src/`**, **`tests/`** (including `tests/*.rs`), or **`tests/samples/`** / other tracked fixtures must follow **[GIT_COMMIT_POLICY.md](GIT_COMMIT_POLICY.md)** — message shape, atomic changes, verification before push, and Paperclip co-author trailers when applicable.
+
+Read that file before your first merge request that changes code, tests, or samples.
+
 ## Toolchain (no venv)
 
 | Need | Notes |
@@ -63,13 +69,13 @@ cargo test --test integration_tests
 cargo test -- --nocapture
 ```
 
-Benchmarks / extra binaries (if present): `cargo run --release --bin benchmark_extractors -- --help`
+Benchmarks: Criterion hot-path benches — `cargo bench --bench hot_paths`; extractor I/O tool — `cargo run --release --bin benchmark_extractors -- --help`
 
 ## Where `tests/samples` lives
 
 Regression and scenario assets live under the **tests** tree (not a top-level `samples/` folder):
 
-- `tests/samples/` — synthetic and downscaled fixtures (e.g. `synthetic/`, `downscaled_2file/`), often with `segments.json` ground truth.
+- `tests/samples/synthetic/` — in-repo fixtures (including `downscaled_2file/`). Large non-synthetic corpora stay local-only; see `.gitignore`.
 - Integration tests in `tests/*.rs` load these paths; read the test module for exact expectations.
 
 Browse:
@@ -105,6 +111,7 @@ Use this on the first working session after access is granted.
 
 - [ ] Confirm shell `cwd` matches Paperclip primary workspace (`tv_truncator_tmp` → same tree as this repo).
 - [ ] `git status` clean on agreed branch; remote tracking set.
+- [ ] Read [GIT_COMMIT_POLICY.md](GIT_COMMIT_POLICY.md); commits touching `src/`, `tests/`, or `tests/samples/` must follow it.
 - [ ] `cargo build --release` succeeds.
 - [ ] `cargo test` passes (or note failing tests + open issue).
 - [ ] GStreamer sanity: `gst-inspect-1.0 matroskademux` (or per README).

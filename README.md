@@ -70,7 +70,8 @@ cargo build --release --no-default-features --features ffmpeg
 
 ## Contributing
 
-See [docs/GIT_COMMIT_POLICY.md](docs/GIT_COMMIT_POLICY.md) for commit message conventions, scope expectations, and pre-push checks.
+- **Git commits** (mandatory when changing `src/`, `tests/`, or `tests/samples/`): [docs/GIT_COMMIT_POLICY.md](docs/GIT_COMMIT_POLICY.md)
+- **IC onboarding** (workspace, toolchain, day-1 checklist): [docs/IC_ONBOARDING.md](docs/IC_ONBOARDING.md)
 
 ## Usage
 
@@ -241,7 +242,3 @@ cargo test -- --nocapture
 ## License
 
 [Add your license information here]
-
-## Contributing
-
-Start with [docs/IC_ONBOARDING.md](docs/IC_ONBOARDING.md) for workspace path, toolchain, tests, and day-1 checklist (founding IC / Paperclip execution).

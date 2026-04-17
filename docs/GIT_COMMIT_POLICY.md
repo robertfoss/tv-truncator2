@@ -2,6 +2,12 @@
 
 This repository uses Git history as part of the review story: commits should be easy to read, bisect, and revert.
 
+## Mandatory use (engineers)
+
+**Board policy:** any commit that changes **application code** (`src/`), **tests** (`tests/**/*.rs` and related harness code), or **tracked fixtures/samples** (for example `tests/samples/`, golden manifests, or other sample assets checked into git) **must** follow this document for message format, atomicity, hygiene, and verification expectations.
+
+Pure documentation edits under `docs/` alone are encouraged to follow the same conventions but are not the primary enforcement boundary.
+
 ## Goals
 
 - Each commit should express **one coherent change** (or one tightly related bundle that would not make sense split).

@@ -1,0 +1,40 @@
+{
+  "test_name": "intro_outro",
+  "description": "Three files with identical intro (0-35s) and outro (65-99s), but different middle sections of varying lengths",
+  "files": [
+    "intro_outro_1.mkv",
+    "intro_outro_2.mkv",
+    "intro_outro_3.mkv"
+  ],
+  "expected_segments": [
+    {
+      "segment_id": "intro",
+      "match_type": "video",
+      "start_time": "0.0s",
+      "end_time": "35.0s",
+      "time_shifted": false,
+      "per_file_timing": {
+        "intro_outro_1.mkv": { "start": "0.0s", "end": "34.8s", "offset": "0.0s" },
+        "intro_outro_2.mkv": { "start": "0.0s", "end": "34.8s", "offset": "0.0s" },
+        "intro_outro_3.mkv": { "start": "0.0s", "end": "34.8s", "offset": "0.0s" }
+      },
+      "files": ["intro_outro_1.mkv", "intro_outro_2.mkv", "intro_outro_3.mkv"],
+      "notes": "Identical intro sequence appears at the same timestamp in all three files"
+    },
+    {
+      "segment_id": "outro",
+      "match_type": "video",
+      "start_time": "55.0s",
+      "end_time": "1:49.0",
+      "time_shifted": true,
+      "per_file_timing": {
+        "intro_outro_1.mkv": { "start": "55.0s", "end": "1:19.8", "offset": "0.0s" },
+        "intro_outro_2.mkv": { "start": "58.8s", "end": "1:44.8", "offset": "3.8s" },
+        "intro_outro_3.mkv": { "start": "1:02.6", "end": "1:48.6", "offset": "7.6s" }
+      },
+      "files": ["intro_outro_1.mkv", "intro_outro_2.mkv", "intro_outro_3.mkv"],
+      "notes": "Outro sequence is time-shifted because the middle sections have different lengths. Detected as audio+video match with per-file timing."
+    }
+  ]
+}
+

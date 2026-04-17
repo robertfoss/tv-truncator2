@@ -123,12 +123,31 @@ pub fn extract_chromaprint_landmarks(samples: &[f32], sample_rate: f32) -> Resul
                 for (band2, energy2) in &peaks {
                     // Include energy information in hash for better distinctiveness
                     // Quantize energies to 4 levels (2 bits each)
-                    let e1_quant = if *energy1 < 0.25 { 0 } else if *energy1 < 0.5 { 1 } else if *energy1 < 0.75 { 2 } else { 3 };
-                    let e2_quant = if *energy2 < 0.25 { 0 } else if *energy2 < 0.5 { 1 } else if *energy2 < 0.75 { 2 } else { 3 };
-                    
+                    let e1_quant = if *energy1 < 0.25 {
+                        0
+                    } else if *energy1 < 0.5 {
+                        1
+                    } else if *energy1 < 0.75 {
+                        2
+                    } else {
+                        3
+                    };
+                    let e2_quant = if *energy2 < 0.25 {
+                        0
+                    } else if *energy2 < 0.5 {
+                        1
+                    } else if *energy2 < 0.75 {
+                        2
+                    } else {
+                        3
+                    };
+
                     // Hash: band1 (4 bits) | energy1 (2 bits) | band2 (4 bits) | energy2 (2 bits)
-                    let hash = ((*band1 as u32) << 8) | (e1_quant << 6) | ((*band2 as u32) << 2) | e2_quant;
-                    
+                    let hash = ((*band1 as u32) << 8)
+                        | (e1_quant << 6)
+                        | ((*band2 as u32) << 2)
+                        | e2_quant;
+
                     landmarks.push(Landmark { hash, timestamp });
                 }
             }
@@ -226,7 +245,10 @@ pub fn extract_spectral_hash_v2(samples: &[f32], sample_rate: f32) -> Result<Vec
         let timestamp = position as f64 / sample_rate as f64;
 
         // Normalize
-        let max_val = window_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        let max_val = window_samples
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
         let normalized: Vec<f32> = if max_val > 0.0001 {
             window_samples.iter().map(|s| s / max_val).collect()
         } else {
@@ -400,7 +422,7 @@ fn mel_to_hz(mel: f32) -> f32 {
 /// Find spectral peaks in mel bands
 fn find_spectral_peaks(bands: &[f32]) -> Vec<(usize, f32)> {
     let mut peaks = Vec::new();
-    
+
     // Find max energy to set adaptive threshold
     let max_energy = bands.iter().fold(0.0f32, |a, &b| a.max(b));
     let threshold = max_energy * 0.2; // 20% of max energy
@@ -411,8 +433,8 @@ fn find_spectral_peaks(bands: &[f32]) -> Vec<(usize, f32)> {
         }
 
         // Check if this is a local maximum
-        let is_peak = (i == 0 || energy > bands[i - 1])
-            && (i == bands.len() - 1 || energy > bands[i + 1]);
+        let is_peak =
+            (i == 0 || energy > bands[i - 1]) && (i == bands.len() - 1 || energy > bands[i + 1]);
 
         if is_peak {
             peaks.push((i, energy));
@@ -435,7 +457,8 @@ fn compute_dct(input: &[f32], num_coeffs: usize) -> Vec<f32> {
         let mut sum = 0.0f32;
         for (i, &val) in input.iter().enumerate() {
             let log_val = if val > 1e-10 { val.ln() } else { -23.0 }; // log floor
-            sum += log_val * ((std::f32::consts::PI * k as f32 * (i as f32 + 0.5)) / n as f32).cos();
+            sum +=
+                log_val * ((std::f32::consts::PI * k as f32 * (i as f32 + 0.5)) / n as f32).cos();
         }
         coeffs[k] = sum;
     }
@@ -674,4 +697,3 @@ mod tests {
         assert_eq!(features[0].bands.len(), NUM_ENERGY_BANDS);
     }
 }
-

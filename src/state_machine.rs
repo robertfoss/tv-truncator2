@@ -105,7 +105,8 @@ impl ProcessingState {
     pub fn reached_second_sync(&self) -> bool {
         matches!(
             self,
-            ProcessingState::Analyzed { .. }
+            ProcessingState::ExtractedAudio { .. }
+                | ProcessingState::Analyzed { .. }
                 | ProcessingState::FindingRepeated { .. }
                 | ProcessingState::Cutting { .. }
                 | ProcessingState::Done { .. }
@@ -405,6 +406,13 @@ mod tests {
         };
         assert!(analyzed.reached_first_sync());
         assert!(analyzed.reached_second_sync());
+
+        let extracted_audio = ProcessingState::ExtractedAudio {
+            samples_processed: 100,
+            samples_total: 100,
+        };
+        assert!(extracted_audio.reached_first_sync());
+        assert!(extracted_audio.reached_second_sync());
 
         let probing = ProcessingState::Probing { progress: 0.5 };
         assert!(!probing.reached_first_sync());

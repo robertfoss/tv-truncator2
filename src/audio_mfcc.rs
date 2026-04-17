@@ -49,31 +49,90 @@ pub fn detect_audio_segments_mfcc(
     }
 
     // Step 1: Extract MFCC features from all episodes
-    let mut episode_mfccs: Vec<Vec<MfccFeatures>> = Vec::new();
+    // For efficiency, only extract from regions we'll search (first/last 2 min for long videos)
+    // We use a two-pass approach: process beginning and ending regions separately
+    let mut episode_start_mfccs: Vec<Vec<MfccFeatures>> = Vec::new();
+    let mut episode_end_mfccs: Vec<Vec<MfccFeatures>> = Vec::new();
 
     for (ep_id, episode) in episode_audio.iter().enumerate() {
-        // Use raw audio samples from episode
-        let mfccs = extract_mfcc_features(&episode.raw_samples, episode.sample_rate)?;
+        let duration = episode.raw_samples.len() as f64 / episode.sample_rate as f64;
 
-        if debug_dupes {
-            println!("  Episode {}: {} MFCC frames", ep_id, mfccs.len());
+        // For long videos (>10 min), extract MFCC from first 2 min and last 2 min separately
+        if duration > 600.0 {
+            let samples_per_2min = (episode.sample_rate * 120.0) as usize;
+
+            // Extract from beginning (first 2 min)
+            let start_samples = episode.raw_samples.len().min(samples_per_2min);
+            let start_mfccs =
+                extract_mfcc_features(&episode.raw_samples[..start_samples], episode.sample_rate)?;
+
+            // Extract from end (last 2 min)
+            let end_offset = episode.raw_samples.len().saturating_sub(samples_per_2min);
+            let mut end_mfccs =
+                extract_mfcc_features(&episode.raw_samples[end_offset..], episode.sample_rate)?;
+
+            // Adjust timestamps for end segment to reflect actual position in video
+            let time_offset = end_offset as f64 / episode.sample_rate as f64;
+            for mfcc in &mut end_mfccs {
+                mfcc.timestamp += time_offset;
+            }
+
+            if debug_dupes {
+                println!(
+                    "  Episode {}: {} start frames, {} end frames (duration: {:.1}s)",
+                    ep_id,
+                    start_mfccs.len(),
+                    end_mfccs.len(),
+                    duration
+                );
+            }
+
+            episode_start_mfccs.push(start_mfccs);
+            episode_end_mfccs.push(end_mfccs);
+        } else {
+            // Short video - extract from entire file, use for both start and end
+            let mfccs = extract_mfcc_features(&episode.raw_samples, episode.sample_rate)?;
+
+            if debug_dupes {
+                println!(
+                    "  Episode {}: {} MFCC frames (duration: {:.1}s)",
+                    ep_id,
+                    mfccs.len(),
+                    duration
+                );
+            }
+
+            episode_start_mfccs.push(mfccs.clone());
+            episode_end_mfccs.push(mfccs);
         }
-
-        episode_mfccs.push(mfccs);
     }
 
     // Step 2: Compare all episode pairs using sliding windows
+    // Process beginning and ending regions separately to avoid cross-boundary windows
     let mut potential_matches: Vec<SegmentMatch> = Vec::new();
 
-    for i in 0..episode_mfccs.len() {
-        for j in (i + 1)..episode_mfccs.len() {
-            let matches = find_matching_windows(&episode_mfccs[i], &episode_mfccs[j], i, j);
+    // Pass 1: Find matches in beginning regions (intros)
+    for i in 0..episode_start_mfccs.len() {
+        for j in (i + 1)..episode_start_mfccs.len() {
+            let matches =
+                find_matching_windows(&episode_start_mfccs[i], &episode_start_mfccs[j], i, j);
+            potential_matches.extend(matches);
+        }
+    }
+
+    // Pass 2: Find matches in ending regions (outros)
+    for i in 0..episode_end_mfccs.len() {
+        for j in (i + 1)..episode_end_mfccs.len() {
+            let matches = find_matching_windows(&episode_end_mfccs[i], &episode_end_mfccs[j], i, j);
             potential_matches.extend(matches);
         }
     }
 
     if debug_dupes {
-        println!("  Found {} potential window matches", potential_matches.len());
+        println!(
+            "  Found {} potential window matches",
+            potential_matches.len()
+        );
     }
 
     // Filter out over-long segments
@@ -88,14 +147,17 @@ pub fn detect_audio_segments_mfcc(
         .collect();
 
     if debug_dupes {
-        println!("  After duration filtering: {} matches", filtered_matches.len());
+        println!(
+            "  After duration filtering: {} matches",
+            filtered_matches.len()
+        );
     }
 
     // Step 3: Group matches by episodes and time regions
+    // Note: We don't need the MFCC data for grouping, only for extraction
     let segments = group_matches_into_segments(
         &filtered_matches,
         episode_audio,
-        &episode_mfccs,
         config.threshold,
         config.min_duration,
         debug_dupes,
@@ -133,60 +195,45 @@ fn find_matching_windows(
         return matches;
     }
 
-    // For long videos (>10 min), only search first 2 min and last 2 min
-    // to find openings/endings efficiently
-    let max_time1 = mfccs1.last().unwrap().timestamp;
-    let search_regions = if max_time1 > 600.0 {
-        // Long video - search beginning and end only
-        // MFCC extracts ~50 frames/second, so 2 min = ~6000 frames
-        let frames_per_2min = 6000;
-        vec![
-            (0, mfccs1.len().min(frames_per_2min)), // First 2 min
-            (mfccs1.len().saturating_sub(frames_per_2min), mfccs1.len()), // Last 2 min
-        ]
-    } else {
-        // Short video - search entire video
-        vec![(0, mfccs1.len())]
-    };
+    // Note: For long videos, we've already extracted only beginning/end during feature extraction,
+    // so we search the entire extracted region here.
 
-    // Slide window across search regions in first episode
-    for (region_start, region_end) in search_regions {
-        for pos1 in (region_start..region_end.saturating_sub(MFCC_WINDOW_SIZE)).step_by(MFCC_STEP_SIZE) {
-            let window1 = &mfccs1[pos1..pos1 + MFCC_WINDOW_SIZE];
+    // Slide window across first episode
+    for pos1 in (0..mfccs1.len().saturating_sub(MFCC_WINDOW_SIZE)).step_by(MFCC_STEP_SIZE) {
+        let window1 = &mfccs1[pos1..pos1 + MFCC_WINDOW_SIZE];
 
-            // Find best match in second episode (search whole episode for matches)
-            let mut best_pos2 = 0;
-            let mut best_distance = f32::MAX;
+        // Find best match in second episode (search whole extracted region)
+        let mut best_pos2 = 0;
+        let mut best_distance = f32::MAX;
 
-            for pos2 in (0..mfccs2.len() - MFCC_WINDOW_SIZE).step_by(MFCC_STEP_SIZE) {
-                let window2 = &mfccs2[pos2..pos2 + MFCC_WINDOW_SIZE];
+        for pos2 in (0..mfccs2.len() - MFCC_WINDOW_SIZE).step_by(MFCC_STEP_SIZE) {
+            let window2 = &mfccs2[pos2..pos2 + MFCC_WINDOW_SIZE];
 
-                let distance = compute_window_distance(window1, window2);
+            let distance = compute_window_distance(window1, window2);
 
-                if distance < best_distance {
-                    best_distance = distance;
-                    best_pos2 = pos2;
-                }
+            if distance < best_distance {
+                best_distance = distance;
+                best_pos2 = pos2;
             }
+        }
 
-            // If match is good enough, add it
-            if best_distance < MFCC_DISTANCE_THRESHOLD {
-                let start1 = window1.first().unwrap().timestamp;
-                let end1 = window1.last().unwrap().timestamp;
-                let window2 = &mfccs2[best_pos2..best_pos2 + MFCC_WINDOW_SIZE];
-                let start2 = window2.first().unwrap().timestamp;
-                let end2 = window2.last().unwrap().timestamp;
+        // If match is good enough, add it
+        if best_distance < MFCC_DISTANCE_THRESHOLD {
+            let start1 = window1.first().unwrap().timestamp;
+            let end1 = window1.last().unwrap().timestamp;
+            let window2 = &mfccs2[best_pos2..best_pos2 + MFCC_WINDOW_SIZE];
+            let start2 = window2.first().unwrap().timestamp;
+            let end2 = window2.last().unwrap().timestamp;
 
-                matches.push(SegmentMatch {
-                    episode1: ep1_id,
-                    episode2: ep2_id,
-                    start1,
-                    end1,
-                    start2,
-                    end2,
-                    distance: best_distance,
-                });
-            }
+            matches.push(SegmentMatch {
+                episode1: ep1_id,
+                episode2: ep2_id,
+                start1,
+                end1,
+                start2,
+                end2,
+                distance: best_distance,
+            });
         }
     }
 
@@ -235,7 +282,6 @@ fn compute_mfcc_distance(mfcc1: &MfccFeatures, mfcc2: &MfccFeatures) -> f32 {
 fn group_matches_into_segments(
     matches: &[SegmentMatch],
     episode_audio: &[EpisodeAudio],
-    _episode_mfccs: &[Vec<MfccFeatures>],
     threshold: usize,
     min_duration: f64,
     debug_dupes: bool,
@@ -341,8 +387,7 @@ fn group_matches_into_segments(
         }
 
         // Calculate confidence from average distance
-        let avg_distance =
-            group.iter().map(|m| m.distance).sum::<f32>() / group.len() as f32;
+        let avg_distance = group.iter().map(|m| m.distance).sum::<f32>() / group.len() as f32;
         let confidence = (1.0 - avg_distance.min(1.0)) as f64;
 
         // Check if time-shifted
@@ -380,7 +425,7 @@ fn group_matches_into_segments(
 
     // Split overlong segments first
     let split = split_overlong_segments(common_segments);
-    
+
     // Then merge overlapping segments to eliminate false positives
     let merged = merge_overlapping_segments(split);
 
@@ -427,4 +472,3 @@ mod tests {
         assert!(distance < 0.001);
     }
 }
-

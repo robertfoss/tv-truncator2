@@ -1,0 +1,11 @@
+/target/
+
+# Only `tests/samples/synthetic/` may be committed; large local corpora stay untracked (MEMA-24).
+tests/samples/**
+!tests/samples/synthetic/
+!tests/samples/synthetic/**
+
+# Long-form downscaled episodes + cut outputs stay local; CI clones use segments.json only.
+tests/samples/synthetic/downscaled_2file/**/*.mkv
+tests/samples/synthetic/downscaled_2file/truncated/
+tests/samples/synthetic/downscaled_2file/truncated_test/

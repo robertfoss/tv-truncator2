@@ -1,12 +1,12 @@
 //! Parallel processing orchestration with state machine and synchronization points
 
 use crate::analyzer::{get_video_info, EpisodeFrames, VideoInfo};
-use crate::audio_extractor::{extract_audio_samples, EpisodeAudio};
 use crate::audio_chromaprint::detect_audio_segments_chromaprint;
 use crate::audio_correlation::detect_audio_segments_correlation;
 use crate::audio_energy_bands::detect_audio_segments_energy_bands;
+use crate::audio_extractor::{extract_audio_samples, EpisodeAudio};
 use crate::audio_fingerprint::detect_audio_segments_fingerprint;
-use crate::audio_hasher::process_audio_samples;
+use crate::audio_hasher::{count_spectral_audio_frames, process_audio_samples_with_progress};
 use crate::audio_mfcc::detect_audio_segments_mfcc;
 use crate::audio_spectral_v2::detect_audio_segments_spectral_v2;
 use crate::gstreamer_extractor_v2::{extract_frames_gstreamer_v2, get_video_duration_gstreamer};
@@ -22,6 +22,16 @@ use crate::{Config, Result};
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+fn update_all_finding_repeated_try(processors_arc: &Arc<Mutex<Vec<FileProcessor>>>, progress: f64) {
+    if let Ok(mut procs) = processors_arc.try_lock() {
+        for p in procs.iter_mut() {
+            if !p.state.is_failed() {
+                p.update_finding_repeated(progress);
+            }
+        }
+    }
+}
 
 /// Process multiple video files using the state machine with synchronization points
 pub fn process_files_parallel(
@@ -53,8 +63,12 @@ pub fn process_files_parallel(
     let processors_arc = Arc::new(Mutex::new(processors));
     let coordinator = ProcessingCoordinator::new(processors_arc.clone(), config.clone());
 
-    // Spawn progress display thread
-    let progress_handle = spawn_progress_display(processors_arc.clone());
+    // Spawn progress display thread (disabled in quiet / JSON script mode)
+    let progress_handle = if config.quiet || config.json_summary {
+        std::thread::spawn(|| {})
+    } else {
+        spawn_progress_display(processors_arc.clone())
+    };
 
     // Main processing pipeline
     let result = process_pipeline(coordinator, processors_arc.clone(), &config);
@@ -83,7 +97,7 @@ fn process_pipeline(
     if !config.audio_only {
         extract_frames_parallel(&processors_arc, config)?;
     }
-    
+
     if config.enable_audio_matching || config.audio_only {
         extract_audio_parallel(&processors_arc, config)?;
     }
@@ -308,13 +322,11 @@ fn extract_frames_with_state_machine_progress(
         sample_rate,
         move |current, total| {
             // Update the state machine with current progress
-            if let Err(e) = update_processor_state(
-                &processors_arc_clone,
-                &video_path_for_callback,
-                |p| {
+            if let Err(e) =
+                update_processor_state(&processors_arc_clone, &video_path_for_callback, |p| {
                     p.update_extracting_video(current, total);
-                },
-            ) {
+                })
+            {
                 eprintln!("Failed to update processor state: {}", e);
             }
         },
@@ -394,12 +406,24 @@ fn extract_audio_single_file(
     let sample_rate_hz = 22050; // 22.05 kHz mono audio
     let frame_rate = if config.quick { 0.5 } else { 1.0 }; // Audio frames per second
 
+    // Re-use duration from the probe phase so we do not run a second discoverer pass
+    // (that work was invisible in the "Extracting Audio" UX and could take a long time).
+    let duration_hint = {
+        let processors_guard = processors_arc.lock().unwrap();
+        processors_guard
+            .iter()
+            .find(|p| &p.file_path == file_path)
+            .and_then(|p| p.video_info.as_ref())
+            .map(|vi| vi.duration)
+    };
+
     // Extract raw audio samples with progress tracking
     let processors_clone = processors_arc.clone();
     let file_path_clone = file_path.clone();
     let audio_samples = extract_audio_samples(
         file_path,
         sample_rate_hz,
+        duration_hint,
         move |current, total| {
             let _ = update_processor_state(&processors_clone, &file_path_clone, |p| {
                 // Use ExtractingAudio state
@@ -411,8 +435,25 @@ fn extract_audio_single_file(
         },
     )?;
 
-    // Process audio samples into audio frames with spectral hashes
-    let audio_frames = process_audio_samples(&audio_samples, sample_rate_hz as f32, frame_rate)?;
+    let spectral_total =
+        count_spectral_audio_frames(audio_samples.len(), sample_rate_hz as f32, frame_rate).max(1);
+    update_processor_state(processors_arc, file_path, |p| {
+        p.update_extracting_audio(0, spectral_total);
+    })?;
+
+    // Process audio samples into audio frames with spectral hashes (CPU-heavy; keep UI moving)
+    let processors_spectral = processors_arc.clone();
+    let file_path_spectral = file_path.clone();
+    let audio_frames = process_audio_samples_with_progress(
+        &audio_samples,
+        sample_rate_hz as f32,
+        frame_rate,
+        move |done, total| {
+            let _ = update_processor_state(&processors_spectral, &file_path_spectral, |p| {
+                p.update_extracting_audio(done, total);
+            });
+        },
+    )?;
 
     // Store audio frames in processor (including raw samples for advanced algorithms)
     let episode_audio = EpisodeAudio {
@@ -602,7 +643,7 @@ fn find_repeated_segments(
                     }
                 }
             }
-            
+
             let audio_segments = match config.audio_algorithm {
                 crate::AudioAlgorithm::Chromaprint => {
                     detect_audio_segments_chromaprint(&all_audio, config, config.debug_dupes)?
@@ -636,12 +677,12 @@ fn find_repeated_segments(
                     }
                 }
             }
-            
+
             merge_overlapping_segments(audio_segments)
         }
     } else if config.enable_audio_matching {
         // Combined audio + video mode
-        
+
         // Update progress to 20% (video detection starting)
         {
             let mut processors_guard = processors_arc.lock().unwrap();
@@ -651,52 +692,97 @@ fn find_repeated_segments(
                 }
             }
         }
-        
-        let video_segments = if all_frames.is_empty() {
-            Vec::new()
-        } else {
-            detect_common_segments(&all_frames, config, config.debug_dupes)?
-        };
-        
-        // Update progress to 50% (audio detection starting)
-        {
-            let mut processors_guard = processors_arc.lock().unwrap();
-            for processor in processors_guard.iter_mut() {
-                if !processor.state.is_failed() {
-                    processor.update_finding_repeated(0.5);
+
+        let pair_progress = Arc::new(Mutex::new((0.0f64, 0.0f64)));
+        let processors_join = Arc::clone(processors_arc);
+        let pair_v = Arc::clone(&pair_progress);
+        let pair_a = Arc::clone(&pair_progress);
+        let processors_v = Arc::clone(&processors_join);
+        let processors_a = Arc::clone(&processors_join);
+
+        let (video_segments_result, audio_segments_result) = rayon::join(
+            || -> Result<Vec<_>> {
+                if all_frames.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    let mut on_progress = |local: f64| {
+                        let v = local.clamp(0.0, 1.0);
+                        if let Ok(mut g) = pair_v.try_lock() {
+                            g.0 = v;
+                            let mx = g.0.max(g.1);
+                            drop(g);
+                            update_all_finding_repeated_try(&processors_v, 0.2 + mx * 0.48);
+                        }
+                    };
+                    detect_common_segments(
+                        &all_frames,
+                        config,
+                        config.debug_dupes,
+                        Some(&mut on_progress),
+                    )
                 }
-            }
-        }
-        
-        let audio_segments = if all_audio.is_empty() {
-            Vec::new()
-        } else {
-            // Use selected audio algorithm
-            match config.audio_algorithm {
-                crate::AudioAlgorithm::Chromaprint => {
-                    detect_audio_segments_chromaprint(&all_audio, config, config.debug_dupes)?
+            },
+            || -> Result<Vec<_>> {
+                if all_audio.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    if let Ok(mut g) = pair_a.try_lock() {
+                        g.1 = 0.02;
+                        let mx = g.0.max(g.1);
+                        drop(g);
+                        update_all_finding_repeated_try(&processors_a, 0.2 + mx * 0.48);
+                    }
+                    // Use selected audio algorithm
+                    match config.audio_algorithm {
+                        crate::AudioAlgorithm::Chromaprint => detect_audio_segments_chromaprint(
+                            &all_audio,
+                            config,
+                            config.debug_dupes,
+                        ),
+                        crate::AudioAlgorithm::Mfcc => {
+                            detect_audio_segments_mfcc(&all_audio, config, config.debug_dupes)
+                        }
+                        crate::AudioAlgorithm::SpectralV2 => detect_audio_segments_spectral_v2(
+                            &all_audio,
+                            config,
+                            config.debug_dupes,
+                        ),
+                        crate::AudioAlgorithm::EnergyBands => detect_audio_segments_energy_bands(
+                            &all_audio,
+                            config,
+                            config.debug_dupes,
+                        ),
+                        // Legacy algorithms
+                        crate::AudioAlgorithm::SpectralHash => {
+                            detect_audio_segments(&all_audio, config, config.debug_dupes)
+                        }
+                        crate::AudioAlgorithm::CrossCorrelation => {
+                            detect_audio_segments_correlation(
+                                &all_audio,
+                                config,
+                                config.debug_dupes,
+                            )
+                        }
+                        crate::AudioAlgorithm::Fingerprint => detect_audio_segments_fingerprint(
+                            &all_audio,
+                            config,
+                            config.debug_dupes,
+                        ),
+                    }
+                    .map(|segments| {
+                        if let Ok(mut g) = pair_a.try_lock() {
+                            g.1 = 1.0;
+                            let mx = g.0.max(g.1);
+                            drop(g);
+                            update_all_finding_repeated_try(&processors_a, 0.2 + mx * 0.48);
+                        }
+                        segments
+                    })
                 }
-                crate::AudioAlgorithm::Mfcc => {
-                    detect_audio_segments_mfcc(&all_audio, config, config.debug_dupes)?
-                }
-                crate::AudioAlgorithm::SpectralV2 => {
-                    detect_audio_segments_spectral_v2(&all_audio, config, config.debug_dupes)?
-                }
-                crate::AudioAlgorithm::EnergyBands => {
-                    detect_audio_segments_energy_bands(&all_audio, config, config.debug_dupes)?
-                }
-                // Legacy algorithms
-                crate::AudioAlgorithm::SpectralHash => {
-                    detect_audio_segments(&all_audio, config, config.debug_dupes)?
-                }
-                crate::AudioAlgorithm::CrossCorrelation => {
-                    detect_audio_segments_correlation(&all_audio, config, config.debug_dupes)?
-                }
-                crate::AudioAlgorithm::Fingerprint => {
-                    detect_audio_segments_fingerprint(&all_audio, config, config.debug_dupes)?
-                }
-            }
-        };
+            },
+        );
+        let video_segments = video_segments_result?;
+        let audio_segments = audio_segments_result?;
 
         // Update progress to 80% (merging segments)
         {
@@ -713,7 +799,7 @@ fn find_repeated_segments(
         merge_overlapping_segments(combined)
     } else {
         // Video-only mode (default)
-        
+
         // Update progress to 30% (video detection starting)
         {
             let mut processors_guard = processors_arc.lock().unwrap();
@@ -723,12 +809,24 @@ fn find_repeated_segments(
                 }
             }
         }
-        
+
         if all_frames.is_empty() {
             Vec::new()
         } else {
-            let video_segments = detect_common_segments(&all_frames, config, config.debug_dupes)?;
-            
+            let processors_cb = Arc::clone(processors_arc);
+            let mut on_progress = |local: f64| {
+                update_all_finding_repeated_try(
+                    &processors_cb,
+                    0.3 + local.clamp(0.0, 1.0) * 0.5,
+                );
+            };
+            let video_segments = detect_common_segments(
+                &all_frames,
+                config,
+                config.debug_dupes,
+                Some(&mut on_progress),
+            )?;
+
             // Update progress to 80% (merging)
             {
                 let mut processors_guard = processors_arc.lock().unwrap();
@@ -738,7 +836,7 @@ fn find_repeated_segments(
                     }
                 }
             }
-            
+
             merge_overlapping_segments(video_segments)
         }
     };
@@ -833,8 +931,6 @@ fn cut_single_file(
     Ok(())
 }
 
-/// Helper functions
-
 fn update_processor_state<F>(
     processors_arc: &Arc<Mutex<Vec<FileProcessor>>>,
     file_path: &PathBuf,
@@ -901,40 +997,63 @@ fn estimate_frame_count(video_info: &VideoInfo, config: &Config) -> usize {
     (duration * sample_rate) as usize
 }
 
+/// Below this frame count (or when `config.debug` is set), use sequential analysis
+/// with fine-grained progress updates. Above it, use a parallel rolling-hash pass.
+const PARALLEL_FRAME_ANALYSIS_MIN_FRAMES: usize = 1024;
+
 /// Analyze frames for patterns with progress tracking
 fn analyze_frames_for_patterns_with_progress(
     frames: &EpisodeFrames,
     processors_arc: &Arc<Mutex<Vec<FileProcessor>>>,
     file_path: &PathBuf,
-    _config: &Config,
+    config: &Config,
 ) -> Result<Vec<u64>> {
+    use crate::hasher::rolling_hash_analysis_vector_par_with_progress;
     use crate::hasher::RollingHash;
 
     let total_frames = frames.frames.len();
-    let mut analysis_results = Vec::with_capacity(total_frames);
+    let perceptual: Vec<u64> = frames.frames.iter().map(|f| f.perceptual_hash).collect();
 
-    // Use a window size of 5 for rolling hash
-    let mut rolling_hash = RollingHash::new(5);
+    let analysis_results = if total_frames >= PARALLEL_FRAME_ANALYSIS_MIN_FRAMES && !config.debug {
+        let mut progress_err: Option<anyhow::Error> = None;
+        let out = rolling_hash_analysis_vector_par_with_progress(&perceptual, |end_index| {
+            if progress_err.is_some() {
+                return;
+            }
+            if let Err(e) = update_processor_state(processors_arc, file_path, |p| {
+                p.update_analyzing(end_index, total_frames);
+            }) {
+                progress_err = Some(e);
+            }
+        });
+        if let Some(e) = progress_err {
+            return Err(e);
+        }
+        out
+    } else {
+        let mut analysis_results = Vec::with_capacity(total_frames);
+        let mut rolling_hash = RollingHash::new(5);
 
-    for (i, frame) in frames.frames.iter().enumerate() {
-        // Add frame hash to rolling hash
-        if let Some(hash_value) = rolling_hash.add(frame.perceptual_hash) {
-            analysis_results.push(hash_value);
-        } else {
-            // Window not full yet, use the frame hash directly
-            analysis_results.push(frame.perceptual_hash);
+        for (i, ph) in perceptual.iter().enumerate() {
+            if let Some(hash_value) = rolling_hash.add(*ph) {
+                analysis_results.push(hash_value);
+            } else {
+                analysis_results.push(*ph);
+            }
+
+            if i % 5 == 0 || i == total_frames - 1 {
+                update_processor_state(processors_arc, file_path, |p| {
+                    p.update_analyzing(i + 1, total_frames);
+                })?;
+
+                if config.debug {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         }
 
-        // Update progress every 5 frames or on the last frame
-        if i % 5 == 0 || i == total_frames - 1 {
-            update_processor_state(processors_arc, file_path, |p| {
-                p.update_analyzing(i + 1, total_frames);
-            })?;
-
-            // Add a small delay to make progress visible
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
+        analysis_results
+    };
 
     Ok(analysis_results)
 }

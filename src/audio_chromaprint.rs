@@ -5,7 +5,9 @@
 
 use crate::audio_extractor::EpisodeAudio;
 use crate::audio_features::{extract_chromaprint_landmarks, Landmark};
-use crate::audio_segment_utils::{merge_overlapping_segments as merge_segments_util, split_overlong_segments};
+use crate::audio_segment_utils::{
+    merge_overlapping_segments as merge_segments_util, split_overlong_segments,
+};
 use crate::segment_detector::{CommonSegment, EpisodeSegmentTiming, MatchType};
 use crate::Result;
 use std::collections::HashMap;
@@ -62,23 +64,26 @@ pub fn detect_audio_segments_chromaprint(
             // Long video - extract from first 2 min and last 2 min
             // Provides enough context to find 90s openings/endings
             let samples_per_2min = (episode.sample_rate * 120.0) as usize;
-            
-            let beginning_samples = &episode.raw_samples[..samples_per_2min.min(episode.raw_samples.len())];
+
+            let beginning_samples =
+                &episode.raw_samples[..samples_per_2min.min(episode.raw_samples.len())];
             let ending_start = episode.raw_samples.len().saturating_sub(samples_per_2min);
             let ending_samples = &episode.raw_samples[ending_start..];
-            
+
             // Extract from beginning
-            let mut landmarks = extract_chromaprint_landmarks(beginning_samples, episode.sample_rate)?;
-            
+            let mut landmarks =
+                extract_chromaprint_landmarks(beginning_samples, episode.sample_rate)?;
+
             // Extract from ending and adjust timestamps
             // IMPORTANT: Keep these separate by adding them with large timestamp offset
-            let mut ending_landmarks = extract_chromaprint_landmarks(ending_samples, episode.sample_rate)?;
+            let mut ending_landmarks =
+                extract_chromaprint_landmarks(ending_samples, episode.sample_rate)?;
             let time_offset = ending_start as f64 / episode.sample_rate as f64;
             for landmark in &mut ending_landmarks {
                 landmark.timestamp += time_offset;
             }
             landmarks.extend(ending_landmarks);
-            
+
             landmarks
         } else {
             // Short video - extract from entire video
@@ -86,8 +91,12 @@ pub fn detect_audio_segments_chromaprint(
         };
 
         if debug_dupes {
-            println!("  Episode {}: {} landmarks extracted (duration={:.1}s)", 
-                     ep_id, landmarks.len(), duration);
+            println!(
+                "  Episode {}: {} landmarks extracted (duration={:.1}s)",
+                ep_id,
+                landmarks.len(),
+                duration
+            );
         }
 
         episode_landmarks.push(landmarks);
@@ -98,20 +107,18 @@ pub fn detect_audio_segments_chromaprint(
 
     for i in 0..episode_landmarks.len() {
         for j in (i + 1)..episode_landmarks.len() {
-            let matches = find_matching_sequences(
-                &episode_landmarks[i],
-                &episode_landmarks[j],
-                i,
-                j,
-            );
-            
+            let matches =
+                find_matching_sequences(&episode_landmarks[i], &episode_landmarks[j], i, j);
+
             if debug_dupes && !matches.is_empty() {
                 println!(
                     "  Episodes {} vs {}: {} matching sequences",
-                    i, j, matches.len()
+                    i,
+                    j,
+                    matches.len()
                 );
             }
-            
+
             all_matches.extend(matches);
         }
     }
@@ -127,9 +134,9 @@ pub fn detect_audio_segments_chromaprint(
             let dur1 = m.end1 - m.start1;
             let dur2 = m.end2 - m.start2;
             // Keep only reasonable theme song/credits durations
-            let duration_ok = dur1 >= MIN_SEGMENT_DURATION 
+            let duration_ok = dur1 >= MIN_SEGMENT_DURATION
                 && dur2 >= MIN_SEGMENT_DURATION
-                && dur1 <= MAX_SEGMENT_DURATION 
+                && dur1 <= MAX_SEGMENT_DURATION
                 && dur2 <= MAX_SEGMENT_DURATION;
             let similar_duration = (dur1 - dur2).abs() < 30.0;
             duration_ok && similar_duration
@@ -137,11 +144,15 @@ pub fn detect_audio_segments_chromaprint(
         .collect();
 
     if debug_dupes {
-        println!("  After filtering: {} valid sequences", filtered_matches.len());
+        println!(
+            "  After filtering: {} valid sequences",
+            filtered_matches.len()
+        );
     }
 
     // Step 3: Group matches into multi-episode segments
-    let segments = group_matches_into_segments(&filtered_matches, episode_audio, config, debug_dupes);
+    let segments =
+        group_matches_into_segments(&filtered_matches, episode_audio, config, debug_dupes);
 
     if debug_dupes {
         println!("🎵 [Chromaprint] Detected {} segments", segments.len());
@@ -212,7 +223,7 @@ fn find_matching_sequences(
         // Round offset to nearest 5 seconds to group similar offsets
         let offset = (t2 - t1) / 5.0;
         let offset_bin = offset.round() as i32;
-        
+
         offset_bins
             .entry(offset_bin)
             .or_insert_with(Vec::new)
@@ -232,31 +243,31 @@ fn find_matching_sequences(
         while start_idx < bin_matches.len() {
             let region_start1 = bin_matches[start_idx].0;
             let region_start2 = bin_matches[start_idx].1;
-            
+
             // Extend region as long as matches are VERY DENSE
             let mut end_idx = start_idx;
             let mut match_count = 1;
-            
+
             for i in (start_idx + 1)..bin_matches.len() {
                 let time_since_start = bin_matches[i].0 - region_start1;
                 let time_since_last = bin_matches[i].0 - bin_matches[end_idx].0;
-                
+
                 // Calculate current density
                 let current_density = (match_count + 1) as f64 / time_since_start.max(1.0);
-                
+
                 // Stop if:
                 // 1. Gap too large (>3s), OR
-                // 2. Total duration reaching max limit (4 min), OR  
+                // 2. Total duration reaching max limit (4 min), OR
                 // 3. Density dropping too low (< 0.05 matches/sec for quality)
                 // 4. Huge time jump (>300s) indicating beginning->ending span
-                if time_since_last >= MAX_LANDMARK_GAP 
+                if time_since_last >= MAX_LANDMARK_GAP
                     || time_since_start >= MAX_SEGMENT_DURATION  // Stop at 4 minutes
                     || current_density < 0.05  // Reasonable density requirement
                     || time_since_last > 300.0
                 {
                     break;
                 }
-                
+
                 end_idx = i;
                 match_count += 1;
             }
@@ -323,7 +334,7 @@ fn group_matches_into_segments(
                 // Use BOTH start and end times for matching
                 let start_close = (m.start1 - first.start1).abs() < 30.0;
                 let end_close = (m.end1 - first.end1).abs() < 30.0;
-                
+
                 // Must match on both start AND end to be same segment
                 if start_close && end_close {
                     group.push(m);
@@ -451,7 +462,7 @@ fn group_matches_into_segments(
 
     // Split any overlong segments first (prevents merging opening+ending)
     let split = split_overlong_segments(common_segments);
-    
+
     // Then merge overlapping segments to eliminate false positives
     let merged = merge_segments_util(split);
 

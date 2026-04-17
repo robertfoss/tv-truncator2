@@ -15,7 +15,7 @@ pub fn split_overlong_segments(segments: Vec<CommonSegment>) -> Vec<CommonSegmen
 
     for seg in segments {
         let duration = seg.end_time - seg.start_time;
-        
+
         if duration <= max_duration {
             // Segment is reasonable length - keep it
             result.push(seg);
@@ -24,7 +24,7 @@ pub fn split_overlong_segments(segments: Vec<CommonSegment>) -> Vec<CommonSegmen
             // In a properly working algorithm, we shouldn't create these in the first place
             // For now, discard them entirely rather than trying to guess boundaries
             // The algorithm should be fixed to not create overlong segments
-            
+
             // Log this for debugging
             eprintln!(
                 "Warning: Discarding overlong audio segment {:.1}s-{:.1}s (duration {:.1}s > {:.1}s max)",
@@ -68,9 +68,9 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
         // merging opening (0-114s) with ending (1341-1411s) into one giant segment
         let gap = segment.start_time - current.end_time;
         let both_short = current_duration < 60.0 && segment_duration < 60.0;
-        
-        let should_merge = overlap_duration >= min_duration * 0.5
-            || (gap >= 0.0 && gap < 2.0 && both_short);
+
+        let should_merge =
+            overlap_duration >= min_duration * 0.5 || (gap >= 0.0 && gap < 2.0 && both_short);
 
         if should_merge {
             // Merge segments
@@ -87,9 +87,8 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
 
             // Merge audio confidence
             if let Some(seg_conf) = segment.audio_confidence {
-                current.audio_confidence = Some(
-                    current.audio_confidence.unwrap_or(0.0).max(seg_conf)
-                );
+                current.audio_confidence =
+                    Some(current.audio_confidence.unwrap_or(0.0).max(seg_conf));
             }
 
             // Merge episode timings if present
@@ -134,7 +133,7 @@ pub fn refine_segment_boundaries(segment: CommonSegment, min_duration: f64) -> C
     if let Some(ref mut timings) = refined.episode_timings {
         for timing in timings.iter_mut() {
             let duration = timing.end_time - timing.start_time;
-            
+
             // Don't refine if segment is already close to minimum
             if duration < min_duration * 1.5 {
                 continue;
@@ -142,14 +141,14 @@ pub fn refine_segment_boundaries(segment: CommonSegment, min_duration: f64) -> C
 
             // Trim up to 20% from start/end if segment is long
             let max_trim = (duration * 0.2).min(10.0);
-            
+
             // Simple heuristic: theme songs often have 1-2s of fade-in/out
             let trim_amount = max_trim.min(2.0);
-            
+
             timing.start_time += trim_amount;
             timing.end_time -= trim_amount;
         }
-        
+
         // Update reference times
         if let Some(ref timings_ref) = refined.episode_timings {
             refined.start_time = timings_ref
@@ -164,11 +163,11 @@ pub fn refine_segment_boundaries(segment: CommonSegment, min_duration: f64) -> C
     } else {
         // No per-episode timings - refine reference time only
         let duration = refined.end_time - refined.start_time;
-        
+
         if duration >= min_duration * 1.5 {
             let max_trim = (duration * 0.2).min(10.0);
             let trim_amount = max_trim.min(2.0);
-            
+
             refined.start_time += trim_amount;
             refined.end_time -= trim_amount;
         }
@@ -207,7 +206,7 @@ mod tests {
         };
 
         let merged = merge_overlapping_segments(vec![seg1, seg2]);
-        
+
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_time, 0.0);
         assert_eq!(merged[0].end_time, 15.0);
@@ -240,8 +239,7 @@ mod tests {
         };
 
         let merged = merge_overlapping_segments(vec![seg1, seg2]);
-        
+
         assert_eq!(merged.len(), 2); // Should NOT merge
     }
 }
-

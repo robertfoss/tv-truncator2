@@ -1,0 +1,44 @@
+{
+  "test_name": "downscaled_2file",
+  "description": "Two full-length TV episodes (Hajime no Ippo episodes 1 and 2) with identical opening and ending sequences",
+  "files": [
+    "[Yellow-Flash]_Hajime_no_Ippo_-_01_[Blu-Ray][720p][10bit][C49D620A].mkv",
+    "[Yellow-Flash]_Hajime_no_Ippo_-_02_[Blu-Ray][720p][10bit][8C797C83].mkv"
+  ],
+  "expected_segments": [
+    {
+      "segment_id": "opening",
+      "match_type": "video",
+      "start_time": "0.0",
+      "end_time": "1:30.0",
+      "time_shifted": false,
+      "per_file_timing": {
+        "[Yellow-Flash]_Hajime_no_Ippo_-_01_[Blu-Ray][720p][10bit][C49D620A].mkv": { "start": "0.0s", "end": "1:30.0", "offset": "0.0s" },
+        "[Yellow-Flash]_Hajime_no_Ippo_-_02_[Blu-Ray][720p][10bit][8C797C83].mkv": { "start": "0.0s", "end": "1:30.0", "offset": "0.0s" }
+      },
+      "files": [
+        "[Yellow-Flash]_Hajime_no_Ippo_-_01_[Blu-Ray][720p][10bit][C49D620A].mkv",
+        "[Yellow-Flash]_Hajime_no_Ippo_-_02_[Blu-Ray][720p][10bit][8C797C83].mkv"
+      ],
+      "notes": "Opening sequence (opening credits/theme song) - 90 seconds (1:30). The actual theme song portion."
+    },
+    {
+      "segment_id": "ending",
+      "match_type": "video",
+      "start_time": "22:21.0",
+      "end_time": "23:31.0",
+      "time_shifted": false,
+      "per_file_timing": {
+        "[Yellow-Flash]_Hajime_no_Ippo_-_01_[Blu-Ray][720p][10bit][C49D620A].mkv": { "start": "22:21.8", "end": "23:31.8", "offset": "0.8s" },
+        "[Yellow-Flash]_Hajime_no_Ippo_-_02_[Blu-Ray][720p][10bit][8C797C83].mkv": { "start": "22:21.4", "end": "23:31.4", "offset": "0.4s" }
+      },
+      "files": [
+        "[Yellow-Flash]_Hajime_no_Ippo_-_01_[Blu-Ray][720p][10bit][C49D620A].mkv",
+        "[Yellow-Flash]_Hajime_no_Ippo_-_02_[Blu-Ray][720p][10bit][8C797C83].mkv"
+      ],
+      "notes": "Ending sequence (ending credits) - 70 seconds starting at 22:21 (1341s). Detected with 92% video confidence. Algorithm trims ending regions to exactly 70s for precise boundary detection."
+    }
+  ],
+  "notes": "Full-length anime episodes (~23.5 minutes each). Both opening (0-108s) and ending (1361-1411s) are identical across episodes. The main episode content in the middle differs."
+}
+

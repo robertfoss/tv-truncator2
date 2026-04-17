@@ -1,0 +1,17 @@
+{
+  "test_name": "intro",
+  "description": "Three files with identical 32-second intro",
+  "files": [
+  "intro_1.mkv",
+  "intro_2.mkv",
+  "intro_3.mkv"
+],
+  "expected_segments": [
+  {
+    "segment_id": "opening",
+    "start_time": "0.0s",
+    "end_time": "32.0s",
+    "files": ["intro_1.mkv", "intro_2.mkv", "intro_3.mkv"]
+  }
+]
+}

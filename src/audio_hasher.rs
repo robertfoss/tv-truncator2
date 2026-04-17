@@ -5,7 +5,7 @@
 
 use crate::audio_extractor::AudioFrame;
 use crate::Result;
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Window size for FFT analysis (power of 2 for efficiency)
 /// Using 8192 for more robust matching with encoded audio
@@ -54,9 +54,11 @@ pub fn extract_spectral_features(samples: &[f32], sample_rate: f32) -> Result<Sp
     } else {
         samples.to_vec() // Silent audio
     };
-    
+
     // Apply Hann window to reduce spectral leakage
-    let window = apodize::hanning_iter(FFT_WINDOW_SIZE).map(|x| x as f32).collect::<Vec<f32>>();
+    let window = apodize::hanning_iter(FFT_WINDOW_SIZE)
+        .map(|x| x as f32)
+        .collect::<Vec<f32>>();
     let windowed: Vec<f32> = normalized
         .iter()
         .zip(window.iter())
@@ -149,37 +151,52 @@ pub fn extract_spectral_features(samples: &[f32], sample_rate: f32) -> Result<Sp
 pub fn generate_audio_hash(features: &SpectralFeatures) -> u64 {
     // Ultra-coarse hash optimized for matching theme songs/credits across encoded episodes
     // Prioritizes robustness over precision - captures general audio character only
-    
+
     // Classify frequency content very coarsely (low, mid, high)
     let freq_class = if features.centroid < 1500.0 {
-        0u64  // Low frequency dominant (speech/bass)
+        0u64 // Low frequency dominant (speech/bass)
     } else if features.centroid < 4000.0 {
-        1u64  // Mid frequency (mixed content)
+        1u64 // Mid frequency (mixed content)
     } else {
-        2u64  // High frequency (effects/cymbals)
+        2u64 // High frequency (effects/cymbals)
     };
-    
+
     // Energy in 4 very broad levels
     let energy_class = if features.energy < 3.0 {
-        0u64  // Very quiet
+        0u64 // Very quiet
     } else if features.energy < 8.0 {
-        1u64  // Quiet
+        1u64 // Quiet
     } else if features.energy < 15.0 {
-        2u64  // Medium/Loud
+        2u64 // Medium/Loud
     } else {
-        3u64  // Very loud
+        3u64 // Very loud
     };
-    
+
     // Check for bass presence (important for music detection)
     let has_bass = if features.dominant_bins.iter().any(|&b| b < 50) {
         1u64
     } else {
         0u64
     };
-    
+
     // Combine into minimal hash (only ~4 bits of information)
     // This will match perceptually similar audio despite encoding differences
     (freq_class << 4) | (energy_class << 2) | has_bass
+}
+
+/// Count spectral frames that [`process_audio_samples`] would emit (FFT windows).
+pub fn count_spectral_audio_frames(samples_len: usize, sample_rate: f32, frame_rate: f32) -> usize {
+    let samples_per_frame = (sample_rate / frame_rate) as usize;
+    if samples_per_frame == 0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut position = 0usize;
+    while position + FFT_WINDOW_SIZE <= samples_len {
+        count += 1;
+        position += samples_per_frame;
+    }
+    count
 }
 
 /// Process audio samples and extract audio frames with spectral hashes
@@ -196,13 +213,32 @@ pub fn process_audio_samples(
     sample_rate: f32,
     frame_rate: f32,
 ) -> Result<Vec<AudioFrame>> {
+    process_audio_samples_with_progress(samples, sample_rate, frame_rate, |_, _| {})
+}
+
+/// Same as [`process_audio_samples`], invoking `progress` with
+/// `(frames_done_inclusive, frames_total)` on a throttled schedule so CLI progress
+/// stays responsive during long FFT passes.
+pub fn process_audio_samples_with_progress<F>(
+    samples: &[f32],
+    sample_rate: f32,
+    frame_rate: f32,
+    mut progress: F,
+) -> Result<Vec<AudioFrame>>
+where
+    F: FnMut(usize, usize),
+{
     let mut audio_frames = Vec::new();
 
     // Calculate hop size based on desired frame rate
     let samples_per_frame = (sample_rate / frame_rate) as usize;
+    let total_frames = count_spectral_audio_frames(samples.len(), sample_rate, frame_rate);
+    let stride = (total_frames / 32).max(1);
 
     let mut position = 0;
+    let mut frame_idx = 0usize;
     while position + FFT_WINDOW_SIZE <= samples.len() {
+        frame_idx += 1;
         let window = &samples[position..position + FFT_WINDOW_SIZE];
 
         // Extract spectral features
@@ -218,6 +254,10 @@ pub fn process_audio_samples(
             timestamp,
             spectral_hash: hash,
         });
+
+        if frame_idx % stride == 0 || frame_idx == total_frames {
+            progress(frame_idx, total_frames.max(1));
+        }
 
         position += samples_per_frame;
     }
@@ -320,4 +360,3 @@ mod tests {
         }
     }
 }
-

@@ -1,8 +1,9 @@
 //! Algorithm validation tests using synthetic test samples
+#![allow(dead_code)]
 
 use serde_json;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tvt::parallel::process_files_parallel;
 use tvt::similarity::SimilarityAlgorithm;
 use tvt::{Config, Result};
@@ -77,7 +78,7 @@ fn run_detection(
         similarity: 90,
         similarity_threshold: test_config.similarity_threshold,
         similarity_algorithm: algorithm,
-        audio_algorithm: tvt::AudioAlgorithm::CrossCorrelation,
+        audio_algorithm: tvt::AudioAlgorithm::Fingerprint,
         dry_run: true, // Don't actually create output files
         quick: false,
         verbose: false,
@@ -86,6 +87,8 @@ fn run_detection(
         parallel_workers: test_config.parallel_workers,
         enable_audio_matching: false, // Regression test - video only
         audio_only: false,
+        quiet: false,
+        json_summary: false,
     };
 
     // Get video files from test directory
@@ -284,6 +287,10 @@ fn test_full_duplicates_current_algorithm() -> Result<()> {
 #[test]
 fn test_opening_credits_current_algorithm() -> Result<()> {
     let test_dir = Path::new("tests/samples/synthetic/opening_credits");
+    if !test_dir.join("segments.json").is_file() {
+        println!("Skipping - synthetic/opening_credits fixture not present");
+        return Ok(());
+    }
     let test_case = load_test_case(test_dir)?;
 
     // Test that we can load the test case

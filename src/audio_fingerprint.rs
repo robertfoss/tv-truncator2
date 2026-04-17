@@ -32,7 +32,9 @@ pub fn generate_mel_fingerprint(samples: &[f32], sample_rate: f32) -> Vec<u8> {
     };
 
     // Apply window
-    let window: Vec<f32> = apodize::hanning_iter(FP_WINDOW_SIZE).map(|x| x as f32).collect();
+    let window: Vec<f32> = apodize::hanning_iter(FP_WINDOW_SIZE)
+        .map(|x| x as f32)
+        .collect();
     let windowed: Vec<f32> = normalized[..FP_WINDOW_SIZE]
         .iter()
         .zip(window.iter())
@@ -164,12 +166,15 @@ pub fn detect_audio_segments_fingerprint(
     }
 
     if debug_dupes {
-        println!("🎵 [Fingerprint] Detecting audio segments across {} episodes", episode_audio.len());
+        println!(
+            "🎵 [Fingerprint] Detecting audio segments across {} episodes",
+            episode_audio.len()
+        );
     }
 
     // For now, use cross-correlation approach but with fingerprint similarity
     // This is a placeholder - full implementation would build a fingerprint database
-    
+
     if debug_dupes {
         println!("🎵 [Fingerprint] Audio fingerprinting not yet implemented for long-form content");
         println!("  Falling back to spectral hash matching");
@@ -204,4 +209,3 @@ mod tests {
         assert!(fingerprint_similarity(&fp1, &fp4) < 0.3);
     }
 }
-

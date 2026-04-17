@@ -1,7 +1,10 @@
 //! Progress display management for state machine processing
 
+use crate::segment_detector::CommonSegment;
 use crate::state_machine::{FileProcessor, ProcessingState};
+use crate::Config;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,10 +33,10 @@ pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> Joi
                 .iter()
                 .map(|p| (p.file_path.clone(), p.filename(), p.state.clone()))
                 .collect();
-            
+
             // Sort by filename (alphabetically)
             processor_data.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-            
+
             // Release the lock before updating progress bars
             drop(processors_guard);
 
@@ -57,14 +60,14 @@ pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> Joi
                     let state_info = format_state_info_from_state(state);
                     let message = format!("{}: {}", state_info, filename);
                     bar.set_message(message);
-                    
+
                     // Update progress position based on state
                     let (progress, length) = get_progress_info_from_state(state);
                     bar.set_position(progress);
                     bar.set_length(length);
                 }
             }
-            
+
             // Re-acquire lock to check completion
             let processors_guard = match processors.try_lock() {
                 Ok(guard) => guard,
@@ -100,9 +103,10 @@ pub fn spawn_progress_display(processors: Arc<Mutex<Vec<FileProcessor>>>) -> Joi
 /// Create a progress bar for a single file
 fn create_file_progress_bar(multi: &MultiProgress) -> ProgressBar {
     let pb = multi.add(ProgressBar::new(100));
+    // `wide_msg` truncates to one row; plain `msg` can wrap (looks like extra lines per bar).
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{bar:40} {msg}")
+            .template("{bar:40} {wide_msg}")
             .unwrap()
             .progress_chars("█▓▒░"),
     );
@@ -130,7 +134,8 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
         ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
-        } | ProcessingState::ExtractingAudio {
+        }
+        | ProcessingState::ExtractingAudio {
             samples_processed: frames_processed,
             samples_total: frames_total,
         } => {
@@ -142,7 +147,8 @@ fn update_progress_bar(bar: &ProgressBar, processor: &FileProcessor) {
         ProcessingState::ExtractedVideo {
             frames_processed,
             frames_total,
-        } | ProcessingState::ExtractedAudio {
+        }
+        | ProcessingState::ExtractedAudio {
             samples_processed: frames_processed,
             samples_total: frames_total,
         } => {
@@ -215,7 +221,8 @@ fn get_progress_info_from_state(state: &ProcessingState) -> (u64, u64) {
         ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
-        } | ProcessingState::ExtractingAudio {
+        }
+        | ProcessingState::ExtractingAudio {
             samples_processed: frames_processed,
             samples_total: frames_total,
         } => {
@@ -226,7 +233,8 @@ fn get_progress_info_from_state(state: &ProcessingState) -> (u64, u64) {
         ProcessingState::ExtractedVideo {
             frames_processed,
             frames_total,
-        } | ProcessingState::ExtractedAudio {
+        }
+        | ProcessingState::ExtractedAudio {
             samples_processed: frames_processed,
             samples_total: frames_total,
         } => {
@@ -250,7 +258,10 @@ fn get_progress_info_from_state(state: &ProcessingState) -> (u64, u64) {
             let pos = *frames_analyzed as u64;
             (pos, total.max(1))
         }
-        ProcessingState::FindingRepeated { .. } => (50, 100),
+        ProcessingState::FindingRepeated { progress } => {
+            let pos = (progress * 100.0) as u64;
+            (pos, 100)
+        }
         ProcessingState::Cutting { progress } => {
             let pos = (progress * 100.0) as u64;
             (pos, 100)
@@ -273,7 +284,8 @@ fn get_progress_info(processor: &FileProcessor) -> (u64, u64) {
         ProcessingState::ExtractingVideo {
             frames_processed,
             frames_total,
-        } | ProcessingState::ExtractingAudio {
+        }
+        | ProcessingState::ExtractingAudio {
             samples_processed: frames_processed,
             samples_total: frames_total,
         } => {
@@ -284,7 +296,8 @@ fn get_progress_info(processor: &FileProcessor) -> (u64, u64) {
         ProcessingState::ExtractedVideo {
             frames_processed,
             frames_total,
-        } | ProcessingState::ExtractedAudio {
+        }
+        | ProcessingState::ExtractedAudio {
             samples_processed: frames_processed,
             samples_total: frames_total,
         } => {
@@ -379,16 +392,78 @@ fn format_state_info(processor: &FileProcessor) -> String {
     }
 }
 
-/// Print a summary of processing results
-pub fn print_summary(processors: &[FileProcessor]) {
+/// Merge and deduplicate common segments reported by each processor (same logic as CLI segment view).
+pub fn merged_common_segments(processors: &[FileProcessor]) -> Vec<CommonSegment> {
+    let mut all_segments = Vec::new();
+    for processor in processors {
+        if let Some(segments) = &processor.common_segments {
+            all_segments.extend(segments.clone());
+        }
+    }
+
+    if all_segments.is_empty() {
+        return all_segments;
+    }
+
+    all_segments.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+    all_segments.dedup_by(|a, b| {
+        (a.start_time - b.start_time).abs() < 0.1 && (a.end_time - b.end_time).abs() < 0.1
+    });
+    all_segments
+}
+
+/// Print a summary of processing results (skipped for `--json-summary`).
+pub fn print_processing_summary(
+    processors: &[FileProcessor],
+    verbose: bool,
+    quiet: bool,
+    json_summary: bool,
+) {
+    if json_summary {
+        return;
+    }
+
     let total_files = processors.len();
     let completed = processors.iter().filter(|p| p.state.is_done()).count();
     let failed = processors.iter().filter(|p| p.state.is_failed()).count();
 
-    println!("\n=== Processing Summary ===");
-    println!("Total files: {}", total_files);
-    println!("Completed: {}", completed);
-    println!("Failed: {}", failed);
+    let total_time = processors
+        .iter()
+        .map(|p| p.total_elapsed())
+        .max()
+        .unwrap_or_default();
+    let secs = total_time.as_secs();
+
+    if quiet {
+        println!(
+            "tvt: done — {}/{} ok, {} failed, {:02}:{:02}",
+            completed,
+            total_files,
+            failed,
+            secs / 60,
+            secs % 60
+        );
+        if failed > 0 {
+            for processor in processors.iter().filter(|p| p.state.is_failed()) {
+                if let ProcessingState::Failed { error } = &processor.state {
+                    eprintln!("  {}: {}", processor.filename(), error);
+                }
+            }
+        }
+        return;
+    }
+
+    if verbose {
+        println!("\n=== Processing Summary ===");
+        println!("Total files: {}", total_files);
+        println!("Completed: {}", completed);
+        println!("Failed: {}", failed);
+    } else {
+        println!(
+            "\nProcessing: {} file(s) — {} completed, {} failed",
+            total_files, completed, failed
+        );
+    }
 
     if failed > 0 {
         println!("\nFailed files:");
@@ -399,27 +474,172 @@ pub fn print_summary(processors: &[FileProcessor]) {
         }
     }
 
-    if completed > 0 {
+    if completed > 0 && verbose {
         println!("\nCompleted files:");
         for processor in processors.iter().filter(|p| p.state.is_done()) {
             if let ProcessingState::Done { output_path } = &processor.state {
                 println!("  {} -> {}", processor.filename(), output_path.display());
             }
         }
+    } else if completed > 0 && !verbose {
+        println!("Outputs written under configured output directory.");
     }
 
-    // Show timing information
+    println!("Total processing time: {:02}:{:02}", secs / 60, secs % 60);
+}
+
+/// Single JSON object for scripting (`--json-summary`).
+#[derive(Serialize)]
+pub struct JsonRunSummary {
+    pub schema_version: u32,
+    pub tool_version: &'static str,
+    pub dry_run: bool,
+    pub input: String,
+    pub output: String,
+    pub video_files_found: usize,
+    pub processing: JsonProcessingSummary,
+    pub segments: Vec<JsonSegmentSummary>,
+    pub total_removed_seconds: f64,
+}
+
+#[derive(Serialize)]
+pub struct JsonProcessingSummary {
+    pub total_files: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub total_time_seconds: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<JsonFailure>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub completed_files: Vec<JsonCompletedFile>,
+}
+
+#[derive(Serialize)]
+pub struct JsonFailure {
+    pub file: String,
+    pub error: String,
+}
+
+#[derive(Serialize)]
+pub struct JsonCompletedFile {
+    pub file: String,
+    pub output: String,
+}
+
+#[derive(Serialize)]
+pub struct JsonEpisodeTiming {
+    pub episode: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+#[derive(Serialize)]
+pub struct JsonSegmentSummary {
+    pub index: usize,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub duration_seconds: f64,
+    pub match_type: String,
+    pub video_confidence: Option<f64>,
+    pub audio_confidence: Option<f64>,
+    pub episode_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub episode_timings: Option<Vec<JsonEpisodeTiming>>,
+}
+
+/// Build machine-readable run summary (stdout line for `--json-summary`).
+pub fn build_json_run_summary(
+    config: &Config,
+    processors: &[FileProcessor],
+    video_files_found: usize,
+) -> JsonRunSummary {
+    let total_files = processors.len();
+    let completed = processors.iter().filter(|p| p.state.is_done()).count();
+    let failed = processors.iter().filter(|p| p.state.is_failed()).count();
+
     let total_time = processors
         .iter()
         .map(|p| p.total_elapsed())
         .max()
         .unwrap_or_default();
 
-    println!(
-        "\nTotal processing time: {:02}:{:02}",
-        total_time.as_secs() / 60,
-        total_time.as_secs() % 60
-    );
+    let mut failures = Vec::new();
+    for processor in processors.iter().filter(|p| p.state.is_failed()) {
+        if let ProcessingState::Failed { error } = &processor.state {
+            failures.push(JsonFailure {
+                file: processor.filename().to_string(),
+                error: error.clone(),
+            });
+        }
+    }
+
+    let mut completed_files = Vec::new();
+    for processor in processors.iter().filter(|p| p.state.is_done()) {
+        if let ProcessingState::Done { output_path } = &processor.state {
+            completed_files.push(JsonCompletedFile {
+                file: processor.filename().to_string(),
+                output: output_path.display().to_string(),
+            });
+        }
+    }
+
+    let merged = merged_common_segments(processors);
+    let total_removed_seconds: f64 = merged.iter().map(|s| s.end_time - s.start_time).sum();
+
+    let segments: Vec<JsonSegmentSummary> = merged
+        .iter()
+        .enumerate()
+        .map(|(i, segment)| {
+            let episode_timings = segment.episode_timings.as_ref().map(|timings| {
+                timings
+                    .iter()
+                    .map(|t| JsonEpisodeTiming {
+                        episode: t.episode_name.clone(),
+                        start_seconds: t.start_time,
+                        end_seconds: t.end_time,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            JsonSegmentSummary {
+                index: i + 1,
+                start_seconds: segment.start_time,
+                end_seconds: segment.end_time,
+                duration_seconds: segment.end_time - segment.start_time,
+                match_type: segment.match_type.to_string(),
+                video_confidence: segment.video_confidence,
+                audio_confidence: segment.audio_confidence,
+                episode_count: segment.episode_list.len(),
+                episodes: segment.episode_list.clone(),
+                episode_timings,
+            }
+        })
+        .collect();
+
+    JsonRunSummary {
+        schema_version: 1,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        dry_run: config.dry_run,
+        input: config.input_dir.display().to_string(),
+        output: config.output_dir.display().to_string(),
+        video_files_found,
+        processing: JsonProcessingSummary {
+            total_files,
+            completed,
+            failed,
+            total_time_seconds: total_time.as_secs_f64(),
+            failures,
+            completed_files,
+        },
+        segments,
+        total_removed_seconds,
+    }
+}
+
+/// Legacy name used in tests — delegates to [`print_processing_summary`] with full verbosity.
+pub fn print_summary(processors: &[FileProcessor]) {
+    print_processing_summary(processors, true, false, false);
 }
 
 #[cfg(test)]
@@ -490,6 +710,15 @@ mod tests {
             output_path: PathBuf::from("output.mkv"),
         });
         assert_eq!(get_progress_info(&processor), (100, 100));
+    }
+
+    #[test]
+    fn test_get_progress_info_from_state_finding_repeated_uses_progress() {
+        let state = ProcessingState::FindingRepeated { progress: 0.2 };
+        assert_eq!(get_progress_info_from_state(&state), (20, 100));
+
+        let state = ProcessingState::FindingRepeated { progress: 0.85 };
+        assert_eq!(get_progress_info_from_state(&state), (85, 100));
     }
 
     #[test]

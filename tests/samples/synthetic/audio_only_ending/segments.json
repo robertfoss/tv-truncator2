@@ -1,0 +1,40 @@
+{
+  "test_name": "audio_only_ending",
+  "description": "Seven files with unique intros and identical 15-second audio outro (from 02.mkv), different ending video",
+  "files": [
+    "video1.mkv",
+    "video2.mkv",
+    "video3.mkv",
+    "video4.mkv",
+    "video5.mkv",
+    "video6.mkv",
+    "video7.mkv"
+  ],
+  "expected_segments": [
+    {
+      "segment_id": "audio_ending",
+      "match_type": "audio",
+      "start_time": 25.0,
+      "end_time": 40.0,
+      "time_shifted": false,
+      "per_file_timing": {
+        "video1.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 },
+        "video2.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 },
+        "video3.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 },
+        "video4.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 },
+        "video5.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 },
+        "video6.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 },
+        "video7.mkv": { "start": 25.0, "end": 40.0, "offset": 0.0 }
+      },
+      "files": [
+        "video1.mkv",
+        "video2.mkv",
+        "video3.mkv",
+        "video4.mkv",
+        "video5.mkv",
+        "video6.mkv",
+        "video7.mkv"
+      ]
+    }
+  ]
+}

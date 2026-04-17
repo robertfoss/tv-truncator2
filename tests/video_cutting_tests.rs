@@ -5,6 +5,39 @@ use std::process::Command;
 use tempfile::TempDir;
 use tvt::video_processor::cut_video_segments;
 
+fn ffprobe_duration_secs(path: &Path) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+fn assert_duration_approx(path: &Path, expected: f64, tol: f64) {
+    let Some(d) = ffprobe_duration_secs(path) else {
+        panic!(
+            "ffprobe failed or returned no duration for {}",
+            path.display()
+        );
+    };
+    assert!(
+        (d - expected).abs() <= tol,
+        "duration for {}: got {d} expected {expected} (±{tol})",
+        path.display()
+    );
+}
+
 /// Create a simple test video using FFmpeg
 fn create_test_video(output_path: &Path, duration: f64) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("ffmpeg")
@@ -15,6 +48,8 @@ fn create_test_video(output_path: &Path, duration: f64) -> Result<(), Box<dyn st
             "testsrc=duration={}:size=320x240:rate=1",
             duration
         ))
+        .arg("-pix_fmt")
+        .arg("yuv420p")
         .arg("-c:v")
         .arg("libx264")
         .arg("-preset")
@@ -65,6 +100,10 @@ fn test_cut_video_segments_single_removal() {
         println!("Skipping test: FFmpeg not available");
         return;
     }
+    if Command::new("ffprobe").arg("-version").output().is_err() {
+        println!("Skipping test: ffprobe not available");
+        return;
+    }
 
     let temp_dir = TempDir::new().unwrap();
     let input_path = temp_dir.path().join("input.mp4");
@@ -84,10 +123,8 @@ fn test_cut_video_segments_single_removal() {
     // Verify output file exists
     assert!(output_path.exists());
 
-    // Verify output is smaller than input (segment was removed)
-    let input_size = std::fs::metadata(&input_path).unwrap().len();
-    let output_size = std::fs::metadata(&output_path).unwrap().len();
-    assert!(output_size < input_size);
+    // Stream-copy + concat can mux slightly larger than the source; duration is authoritative.
+    assert_duration_approx(&output_path, 8.0, 0.25);
 }
 
 #[test]
@@ -95,6 +132,10 @@ fn test_cut_video_segments_multiple_removals() {
     // Skip this test if FFmpeg is not available
     if Command::new("ffmpeg").arg("-version").output().is_err() {
         println!("Skipping test: FFmpeg not available");
+        return;
+    }
+    if Command::new("ffprobe").arg("-version").output().is_err() {
+        println!("Skipping test: ffprobe not available");
         return;
     }
 
@@ -113,10 +154,7 @@ fn test_cut_video_segments_multiple_removals() {
     // Verify output file exists
     assert!(output_path.exists());
 
-    // Verify output is smaller than input (segments were removed)
-    let input_size = std::fs::metadata(&input_path).unwrap().len();
-    let output_size = std::fs::metadata(&output_path).unwrap().len();
-    assert!(output_size < input_size);
+    assert_duration_approx(&output_path, 11.0, 0.25);
 }
 
 #[test]
@@ -155,6 +193,10 @@ fn test_cut_video_segments_edge_cases() {
         println!("Skipping test: FFmpeg not available");
         return;
     }
+    if Command::new("ffprobe").arg("-version").output().is_err() {
+        println!("Skipping test: ffprobe not available");
+        return;
+    }
 
     let temp_dir = TempDir::new().unwrap();
     let input_path = temp_dir.path().join("input.mp4");
@@ -168,6 +210,7 @@ fn test_cut_video_segments_edge_cases() {
     let result = cut_video_segments(&input_path, &output_path, &segments_to_remove);
     assert!(result.is_ok());
     assert!(output_path.exists());
+    assert_duration_approx(&output_path, 8.0, 0.25);
 
     // Test removing from the end
     let output_path2 = temp_dir.path().join("output2.mp4");
@@ -175,6 +218,7 @@ fn test_cut_video_segments_edge_cases() {
     let result = cut_video_segments(&input_path, &output_path2, &segments_to_remove);
     assert!(result.is_ok());
     assert!(output_path2.exists());
+    assert_duration_approx(&output_path2, 8.0, 0.25);
 
     // Test removing from the middle
     let output_path3 = temp_dir.path().join("output3.mp4");
@@ -182,4 +226,5 @@ fn test_cut_video_segments_edge_cases() {
     let result = cut_video_segments(&input_path, &output_path3, &segments_to_remove);
     assert!(result.is_ok());
     assert!(output_path3.exists());
+    assert_duration_approx(&output_path3, 8.0, 0.25);
 }

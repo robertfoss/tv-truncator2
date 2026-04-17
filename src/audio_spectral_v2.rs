@@ -164,7 +164,8 @@ fn find_matching_sequences(
         // At ~4 fps hash rate, this is ~480 frames per 2 min
         let frames_per_2min = 480;
         let beginning: Vec<usize> = (0..hashes1.len().min(frames_per_2min)).collect();
-        let ending: Vec<usize> = (hashes1.len().saturating_sub(frames_per_2min)..hashes1.len()).collect();
+        let ending: Vec<usize> =
+            (hashes1.len().saturating_sub(frames_per_2min)..hashes1.len()).collect();
         beginning.into_iter().chain(ending).collect()
     } else {
         // Short video - use all positions
@@ -319,15 +320,15 @@ fn group_matches_into_segments(
             if debug_dupes {
                 println!(
                     "  Rejected group: only {} episodes (need {})",
-                    episode_timings.len(), threshold
+                    episode_timings.len(),
+                    threshold
                 );
             }
             continue;
         }
 
         // Calculate confidence
-        let avg_similarity =
-            group.iter().map(|m| m.similarity).sum::<f64>() / group.len() as f64;
+        let avg_similarity = group.iter().map(|m| m.similarity).sum::<f64>() / group.len() as f64;
 
         let time_shifted = is_time_shifted(&episode_timings);
 
@@ -363,7 +364,7 @@ fn group_matches_into_segments(
 
     // Split overlong segments first
     let split = split_overlong_segments(common_segments);
-    
+
     // Then merge overlapping segments to eliminate false positives
     let merged = merge_overlapping_segments(split);
 
@@ -421,4 +422,3 @@ mod tests {
         assert!(is_time_shifted(&timings_shifted));
     }
 }
-

@@ -51,11 +51,7 @@ pub fn detect_audio_segments_energy_bands(
         let features = extract_energy_bands(&episode.raw_samples, episode.sample_rate)?;
 
         if debug_dupes {
-            println!(
-                "  Episode {}: {} energy band frames",
-                ep_id,
-                features.len()
-            );
+            println!("  Episode {}: {} energy band frames", ep_id, features.len());
         }
 
         episode_features.push(features);
@@ -147,7 +143,10 @@ fn find_matching_patterns(
         let frames_per_2min = 600;
         vec![
             (0, features1.len().min(frames_per_2min)),
-            (features1.len().saturating_sub(frames_per_2min), features1.len()),
+            (
+                features1.len().saturating_sub(frames_per_2min),
+                features1.len(),
+            ),
         ]
     } else {
         vec![(0, features1.len())]
@@ -155,7 +154,9 @@ fn find_matching_patterns(
 
     // Slide window across search regions
     for (region_start, region_end) in search_regions {
-        for pos1 in (region_start..region_end.saturating_sub(PATTERN_WINDOW_SIZE)).step_by(PATTERN_STEP_SIZE) {
+        for pos1 in (region_start..region_end.saturating_sub(PATTERN_WINDOW_SIZE))
+            .step_by(PATTERN_STEP_SIZE)
+        {
             let window1 = &features1[pos1..pos1 + PATTERN_WINDOW_SIZE];
 
             // Find best matching window in second episode
@@ -353,8 +354,7 @@ fn group_matches_into_segments(
         }
 
         // Calculate confidence
-        let avg_correlation =
-            group.iter().map(|m| m.correlation).sum::<f64>() / group.len() as f64;
+        let avg_correlation = group.iter().map(|m| m.correlation).sum::<f64>() / group.len() as f64;
 
         let time_shifted = is_time_shifted(&episode_timings);
 
@@ -390,7 +390,7 @@ fn group_matches_into_segments(
 
     // Split overlong segments first
     let split = split_overlong_segments(common_segments);
-    
+
     // Then merge overlapping segments to eliminate false positives
     let merged = merge_overlapping_segments(split);
 
@@ -437,4 +437,3 @@ mod tests {
         assert!(correlation > 0.95);
     }
 }
-

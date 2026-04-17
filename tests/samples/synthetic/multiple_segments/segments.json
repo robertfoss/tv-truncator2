@@ -1,0 +1,23 @@
+{
+  "test_name": "multiple_segments",
+  "description": "Three files with two identical segments each",
+  "files": [
+  "video1.mkv",
+  "video2.mkv",
+  "video3.mkv"
+],
+  "expected_segments": [
+  {
+    "segment_id": "segment1",
+    "start_time": 0.0,
+    "end_time": 17.7,
+    "files": ["video1.mkv", "video2.mkv", "video3.mkv"]
+  },
+  {
+    "segment_id": "segment2",
+    "start_time": 32.6,
+    "end_time": 48.7,
+    "files": ["video1.mkv", "video2.mkv", "video3.mkv"]
+  }
+]
+}

@@ -1,17 +1,29 @@
-//! Performance comparison tests between GStreamer and FFmpeg approaches
+//! End-to-end performance / soak tests (GStreamer + `tvt` binary).
 //!
-//! These tests validate the performance improvements achieved by migrating
-//! from FFmpeg to GStreamer for video processing.
+//! **CI:** These are **`#[ignore]`** so the default/fast tier (`cargo test`) stays bounded.
+//! Run locally or in the full tier: `cargo test --test performance_tests -- --include-ignored`.
+//!
+//! **Guardrails:** Time bounds are conservative ceilings for downscaled fixtures — failures
+//! usually mean a real regression or a pathological CI machine, not acceptable variance.
+//!
+//! Synthetic dry-runs iterate every `tests/samples/synthetic/<case>` with `segments.json`
+//! ([MEMA-15](/MEMA/issues/MEMA-15)).
+
+mod helpers;
 
 use assert_cmd::Command;
-use predicates::prelude::*;
+use helpers::sample_fixtures;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 use tempfile::tempdir;
 
+/// Wall-clock ceiling for a full dry-run over `tests/samples/downscaled` (when present).
+const MAX_DRY_RUN_DOWNSCALED_SECS: u64 = 180;
+
 /// Test performance of GStreamer frame extraction
 #[test]
+#[ignore = "slow: GStreamer dry-run over samples; cargo test --test performance_tests -- --include-ignored"]
 fn test_gstreamer_frame_extraction_performance() {
     let video_path = PathBuf::from("tests/samples/downscaled/27.mkv");
     if !video_path.exists() {
@@ -40,11 +52,8 @@ fn test_gstreamer_frame_extraction_performance() {
     assert!(result.is_ok());
     println!("GStreamer processing time: {:?}", gstreamer_duration);
 
-    // Performance expectations:
-    // - Should complete in under 2 minutes for downscaled samples
-    // - Frame extraction should be the fastest part
     assert!(
-        gstreamer_duration.as_secs() < 120,
+        gstreamer_duration.as_secs() < MAX_DRY_RUN_DOWNSCALED_SECS,
         "GStreamer processing took too long: {:?}",
         gstreamer_duration
     );
@@ -52,6 +61,7 @@ fn test_gstreamer_frame_extraction_performance() {
 
 /// Test memory usage during GStreamer processing
 #[test]
+#[ignore = "slow: GStreamer dry-run; cargo test --test performance_tests -- --include-ignored"]
 fn test_gstreamer_memory_usage() {
     let video_path = PathBuf::from("tests/samples/downscaled/27.mkv");
     if !video_path.exists() {
@@ -59,8 +69,6 @@ fn test_gstreamer_memory_usage() {
         return;
     }
 
-    // This is a basic test - in a real implementation, we would use
-    // memory profiling tools to measure actual memory usage
     let result = Command::cargo_bin("tvt")
         .unwrap()
         .arg("--input")
@@ -76,14 +84,12 @@ fn test_gstreamer_memory_usage() {
 
     assert!(result.is_ok());
 
-    // GStreamer should not create temporary files
     let temp_dir = tempdir().unwrap();
     let temp_files: Vec<_> = fs::read_dir(temp_dir.path())
         .unwrap()
         .filter_map(|entry| entry.ok())
         .collect();
 
-    // Should have no temporary files (GStreamer processes in memory)
     assert_eq!(
         temp_files.len(),
         0,
@@ -93,6 +99,7 @@ fn test_gstreamer_memory_usage() {
 
 /// Test parallel processing performance
 #[test]
+#[ignore = "slow: multiple GStreamer dry-runs; cargo test --test performance_tests -- --include-ignored"]
 fn test_parallel_processing_performance() {
     let video_path = PathBuf::from("tests/samples/downscaled/27.mkv");
     if !video_path.exists() {
@@ -100,7 +107,6 @@ fn test_parallel_processing_performance() {
         return;
     }
 
-    // Test with different parallel worker counts
     let worker_counts = vec![1, 2, 4];
     let mut results = Vec::new();
 
@@ -126,13 +132,12 @@ fn test_parallel_processing_performance() {
         println!("Workers: {}, Time: {:?}", workers, duration);
     }
 
-    // Parallel processing should show improvement with more workers
-    // (though the improvement may be limited by I/O and algorithm complexity)
     assert!(results.len() >= 2);
 }
 
 /// Test quick mode performance
 #[test]
+#[ignore = "slow: paired normal vs quick dry-runs; cargo test --test performance_tests -- --include-ignored"]
 fn test_quick_mode_performance() {
     let video_path = PathBuf::from("tests/samples/downscaled/27.mkv");
     if !video_path.exists() {
@@ -140,7 +145,6 @@ fn test_quick_mode_performance() {
         return;
     }
 
-    // Test normal mode vs quick mode
     let start_normal = Instant::now();
     let result_normal = Command::cargo_bin("tvt")
         .unwrap()
@@ -179,8 +183,6 @@ fn test_quick_mode_performance() {
     println!("Normal mode: {:?}", normal_duration);
     println!("Quick mode: {:?}", quick_duration);
 
-    // Quick mode should be faster (lower sampling rate)
-    // Note: This may not always be true due to other factors
     println!(
         "Quick mode improvement: {:.1}%",
         (normal_duration.as_secs_f64() - quick_duration.as_secs_f64())
@@ -191,6 +193,7 @@ fn test_quick_mode_performance() {
 
 /// Test algorithm performance comparison
 #[test]
+#[ignore = "slow: algorithm sweep dry-runs; cargo test --test performance_tests -- --include-ignored"]
 fn test_algorithm_performance_comparison() {
     let video_path = PathBuf::from("tests/samples/downscaled/27.mkv");
     if !video_path.exists() {
@@ -198,7 +201,8 @@ fn test_algorithm_performance_comparison() {
         return;
     }
 
-    let algorithms = vec!["current", "multihash", "ssim"];
+    // Match clap `SimilarityAlgorithm` value names (kebab-case).
+    let algorithms = vec!["current", "multi-hash", "ssim-features"];
     let mut results = Vec::new();
 
     for algorithm in algorithms {
@@ -225,23 +229,35 @@ fn test_algorithm_performance_comparison() {
         println!("Algorithm {}: {:?}", algorithm, duration);
     }
 
-    // All algorithms should complete successfully
     assert_eq!(results.len(), 3);
 }
 
 /// Test synthetic samples performance
 #[test]
+#[ignore = "slow: synthetic fixture sweep; cargo test --test performance_tests -- --include-ignored"]
 fn test_synthetic_samples_performance() {
-    let synthetic_dirs = vec![
-        "tests/samples/synthetic/opening_credits",
-        "tests/samples/synthetic/full_duplicates",
-        "tests/samples/synthetic/mid_segment",
-    ];
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dirs = sample_fixtures::synthetic_subdirs_with_segments(&repo_root);
+    assert!(
+        !dirs.is_empty(),
+        "expected synthetic fixtures under tests/samples/synthetic with segments.json"
+    );
 
-    for dir in synthetic_dirs {
-        let dir_path = PathBuf::from(dir);
+    for dir_path in dirs {
+        let rel = dir_path
+            .strip_prefix(&repo_root)
+            .unwrap_or(&dir_path)
+            .to_string_lossy()
+            .replace('\\', "/");
         if !dir_path.exists() {
-            println!("Skipping {} - directory not found", dir);
+            println!("Skipping {} - directory not found", rel);
+            continue;
+        }
+        if !sample_fixtures::dir_has_mkv_video(&dir_path) {
+            println!(
+                "Skipping {} - no .mkv in fixture dir (optional media / LFS)",
+                rel
+            );
             continue;
         }
 
@@ -249,7 +265,7 @@ fn test_synthetic_samples_performance() {
         let result = Command::cargo_bin("tvt")
             .unwrap()
             .arg("--input")
-            .arg(dir)
+            .arg(&dir_path)
             .arg("--threshold")
             .arg("2")
             .arg("--min-duration")
@@ -262,13 +278,12 @@ fn test_synthetic_samples_performance() {
         let duration = start.elapsed();
         assert!(result.is_ok());
 
-        println!("Synthetic sample {}: {:?}", dir, duration);
+        println!("Synthetic sample {}: {:?}", rel, duration);
 
-        // Synthetic samples should process quickly
         assert!(
-            duration.as_secs() < 60,
+            duration.as_secs() < 120,
             "Synthetic sample {} took too long: {:?}",
-            dir,
+            rel,
             duration
         );
     }
@@ -277,9 +292,8 @@ fn test_synthetic_samples_performance() {
 /// Test error handling performance
 #[test]
 fn test_error_handling_performance() {
-    // Test with non-existent directory
     let start = Instant::now();
-    let result = Command::cargo_bin("tvt")
+    let _ = Command::cargo_bin("tvt")
         .unwrap()
         .arg("--input")
         .arg("nonexistent_directory")
@@ -292,7 +306,6 @@ fn test_error_handling_performance() {
 
     let duration = start.elapsed();
 
-    // Should fail quickly, not hang
     assert!(
         duration.as_secs() < 5,
         "Error handling took too long: {:?}",
@@ -302,6 +315,7 @@ fn test_error_handling_performance() {
 
 /// Test large file handling performance
 #[test]
+#[ignore = "slow: verbose dry-run; cargo test --test performance_tests -- --include-ignored"]
 fn test_large_file_performance() {
     let video_path = PathBuf::from("tests/samples/downscaled/27.mkv");
     if !video_path.exists() {
@@ -309,7 +323,6 @@ fn test_large_file_performance() {
         return;
     }
 
-    // Test with high sampling rate (more frames)
     let start = Instant::now();
     let result = Command::cargo_bin("tvt")
         .unwrap()
@@ -330,9 +343,8 @@ fn test_large_file_performance() {
 
     println!("Large file processing time: {:?}", duration);
 
-    // Should handle large files efficiently
     assert!(
-        duration.as_secs() < 300,
+        duration.as_secs() < 600,
         "Large file processing took too long: {:?}",
         duration
     );

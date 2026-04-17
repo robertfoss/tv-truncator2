@@ -1,7 +1,7 @@
 //! TVT (TV Truncator) - Library for analyzing and removing repetitive segments from TV episodes
 //!
 //! This library provides functionality to:
-//! - Extract frames from video files using FFmpeg
+//! - Extract frames and audio via GStreamer (`gstreamer_extractor_v2`, `audio_extractor`)
 //! - Generate perceptual hashes for frame comparison
 //! - Detect common segments across multiple episodes
 //! - Cut video segments while preserving synchronization
@@ -20,7 +20,9 @@ pub mod audio_segment_utils;
 pub mod audio_spectral_v2;
 pub mod gstreamer_cutter;
 pub mod gstreamer_extractor_v2;
+pub(crate) mod hamming_bk_tree;
 pub mod hasher;
+pub mod input_discovery;
 pub mod parallel;
 pub mod progress_display;
 pub mod segment_detector;
@@ -31,6 +33,8 @@ pub mod video_processor;
 
 /// Common error types used throughout the application
 pub type Result<T> = anyhow::Result<T>;
+
+pub use input_discovery::discover_video_files;
 
 /// Format time in seconds to mm:ss.s format
 /// Minutes only shown if >= 60s
@@ -56,7 +60,7 @@ pub enum AudioAlgorithm {
     SpectralV2,
     /// Energy band pattern matching (simple, effective for theme songs)
     EnergyBands,
-    
+
     // Legacy algorithms (deprecated, kept for compatibility)
     /// Legacy spectral hash matching (deprecated, use SpectralV2)
     #[value(name = "spectral-hash")]
@@ -87,7 +91,11 @@ pub struct Config {
     pub debug_dupes: bool,
     pub parallel_workers: usize,
     pub enable_audio_matching: bool, // Enable audio segment detection
-    pub audio_only: bool,             // Only detect audio segments (skip video)
+    pub audio_only: bool,            // Only detect audio segments (skip video)
+    /// Suppress decorative stdout and progress bars (for scripting).
+    pub quiet: bool,
+    /// Emit a single JSON object with run summary on stdout at end (implies quiet output).
+    pub json_summary: bool,
 }
 
 impl Default for Config {
@@ -108,7 +116,45 @@ impl Default for Config {
             debug_dupes: false,
             parallel_workers: num_cpus::get().saturating_sub(1).max(1),
             enable_audio_matching: true, // Audio matching always enabled
-            audio_only: false,            // Video matching enabled by default
+            audio_only: false,           // Video matching enabled by default
+            quiet: false,
+            json_summary: false,
         }
+    }
+}
+
+/// Minimum episodes that must share a segment for it to be reported ([`Config::threshold`]),
+/// capped so it never exceeds discovered input file count (otherwise detection is impossible).
+pub fn effective_episode_threshold(requested: usize, input_file_count: usize) -> usize {
+    if input_file_count == 0 {
+        return requested;
+    }
+    requested.min(input_file_count).max(1)
+}
+
+#[cfg(test)]
+mod effective_threshold_tests {
+    use super::effective_episode_threshold;
+
+    #[test]
+    fn caps_when_impossible_otherwise() {
+        assert_eq!(effective_episode_threshold(3, 2), 2);
+        assert_eq!(effective_episode_threshold(10, 3), 3);
+    }
+
+    #[test]
+    fn preserves_when_request_is_satisfiable() {
+        assert_eq!(effective_episode_threshold(3, 5), 3);
+        assert_eq!(effective_episode_threshold(2, 5), 2);
+    }
+
+    #[test]
+    fn never_below_one_when_inputs_exist() {
+        assert_eq!(effective_episode_threshold(0, 3), 1);
+    }
+
+    #[test]
+    fn zero_inputs_leaves_requested_unchanged() {
+        assert_eq!(effective_episode_threshold(3, 0), 3);
     }
 }

@@ -1,0 +1,70 @@
+{
+  "test_name": "mixed_audio_video_segments",
+  "description": "Eight files with three types of matches: audio+video (0-25s), audio-only (40-55s), video-only (70-85s)",
+  "files": [
+    "video1.mkv",
+    "video2.mkv",
+    "video3.mkv",
+    "video4.mkv",
+    "video5.mkv",
+    "video6.mkv",
+    "video7.mkv",
+    "video8.mkv"
+  ],
+  "expected_segments": [
+    {
+      "segment_id": "audio_video_opening",
+      "match_type": "audio+video",
+      "start_time": 0.0,
+      "end_time": 25.0,
+      "time_shifted": false,
+      "per_file_timing": "Same timing in all files (0.0s-25.0s)",
+      "files": [
+        "video1.mkv",
+        "video2.mkv",
+        "video3.mkv",
+        "video4.mkv",
+        "video5.mkv",
+        "video6.mkv",
+        "video7.mkv",
+        "video8.mkv"
+      ]
+    },
+    {
+      "segment_id": "audio_only_middle",
+      "match_type": "audio",
+      "start_time": 40.0,
+      "end_time": 55.0,
+      "time_shifted": false,
+      "per_file_timing": "Same timing in all files (40.0s-55.0s)",
+      "files": [
+        "video1.mkv",
+        "video2.mkv",
+        "video3.mkv",
+        "video4.mkv",
+        "video5.mkv",
+        "video6.mkv",
+        "video7.mkv",
+        "video8.mkv"
+      ]
+    },
+    {
+      "segment_id": "video_only_ending",
+      "match_type": "video",
+      "start_time": 70.0,
+      "end_time": 85.0,
+      "time_shifted": false,
+      "per_file_timing": "Same timing in all files (70.0s-85.0s)",
+      "files": [
+        "video1.mkv",
+        "video2.mkv",
+        "video3.mkv",
+        "video4.mkv",
+        "video5.mkv",
+        "video6.mkv",
+        "video7.mkv",
+        "video8.mkv"
+      ]
+    }
+  ]
+}

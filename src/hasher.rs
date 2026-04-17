@@ -1,5 +1,11 @@
 //! Perceptual hashing and Rabin-Karp rolling hash implementation
 
+use rayon::prelude::*;
+
+/// Prime and modulus used by [`RollingHash`] (windowed Rabin–Karp style).
+const ROLLING_PRIME: u64 = 1000000007;
+const ROLLING_MOD: u64 = 1000000009;
+
 /// Rabin-Karp rolling hash implementation
 pub struct RollingHash {
     prime: u64,
@@ -14,8 +20,8 @@ impl RollingHash {
     /// Create a new rolling hash with specified window size
     pub fn new(window_size: usize) -> Self {
         Self {
-            prime: 1000000007,
-            modulus: 1000000009,
+            prime: ROLLING_PRIME,
+            modulus: ROLLING_MOD,
             window_size,
             current_hash: 0,
             window: vec![0; window_size],
@@ -35,10 +41,8 @@ impl RollingHash {
                 // Calculate initial hash using wrapping arithmetic
                 self.current_hash = 0;
                 for &val in &self.window {
-                    self.current_hash = self.current_hash
-                        .wrapping_mul(self.prime)
-                        .wrapping_add(val)
-                        % self.modulus;
+                    self.current_hash =
+                        self.current_hash.wrapping_mul(self.prime).wrapping_add(val) % self.modulus;
                 }
                 Some(self.current_hash)
             } else {
@@ -61,10 +65,8 @@ impl RollingHash {
             // Use wrapping arithmetic to avoid overflow
             self.current_hash = 0;
             for &val in &self.window {
-                self.current_hash = self.current_hash
-                    .wrapping_mul(self.prime)
-                    .wrapping_add(val)
-                    % self.modulus;
+                self.current_hash =
+                    self.current_hash.wrapping_mul(self.prime).wrapping_add(val) % self.modulus;
             }
 
             Some(self.current_hash)
@@ -87,6 +89,93 @@ pub fn hamming_distance(hash1: u64, hash2: u64) -> u32 {
 /// Check if two hashes are similar based on Hamming distance threshold
 pub fn is_similar(hash1: u64, hash2: u64, threshold: u32) -> bool {
     hamming_distance(hash1, hash2) <= threshold
+}
+
+/// Fingerprint for one full window of five perceptual hashes, matching a single
+/// `RollingHash::add` step once the window is full (same formula as the
+/// full-window recomputation in [`RollingHash::add`]).
+#[inline]
+pub fn rolling_hash_window_fingerprint(values: &[u64; 5]) -> u64 {
+    let mut h = 0u64;
+    for &val in values {
+        h = h.wrapping_mul(ROLLING_PRIME).wrapping_add(val) % ROLLING_MOD;
+    }
+    h
+}
+
+/// Per-frame analysis vector used for duplicate detection: streaming
+/// [`RollingHash`] with window size 5, using raw perceptual hashes until the
+/// window is full (same behavior as the previous `parallel.rs` loop).
+pub fn rolling_hash_analysis_vector(perceptual_hashes: &[u64]) -> Vec<u64> {
+    let mut rolling_hash = RollingHash::new(5);
+    let mut out = Vec::with_capacity(perceptual_hashes.len());
+    for &v in perceptual_hashes {
+        if let Some(hash_value) = rolling_hash.add(v) {
+            out.push(hash_value);
+        } else {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Chunk size bounds for parallel tail work so progress callbacks fire often enough
+/// without splitting into thousands of tiny rayon jobs.
+const ROLLING_HASH_PAR_CHUNK_MIN: usize = 128;
+const ROLLING_HASH_PAR_CHUNK_MAX: usize = 4096;
+
+fn rolling_hash_par_chunk_size(tail_len: usize) -> usize {
+    if tail_len == 0 {
+        return 1;
+    }
+    // Aim for ~24 progress updates over the tail.
+    let raw = tail_len / 24;
+    raw.clamp(ROLLING_HASH_PAR_CHUNK_MIN, ROLLING_HASH_PAR_CHUNK_MAX)
+}
+
+/// Bit-identical to [`rolling_hash_analysis_vector`], but computes independent
+/// window fingerprints in parallel for long inputs (indices ≥ 4).
+///
+/// `on_tail_end` is invoked after each parallel chunk completes with the exclusive
+/// end index into `perceptual_hashes` (always in `4..=n`), so UIs can show smooth
+/// progress during long CPU-bound analysis.
+pub fn rolling_hash_analysis_vector_par_with_progress(
+    perceptual_hashes: &[u64],
+    mut on_tail_end: impl FnMut(usize),
+) -> Vec<u64> {
+    let n = perceptual_hashes.len();
+    if n <= 4 {
+        return perceptual_hashes.to_vec();
+    }
+    let mut out = Vec::with_capacity(n);
+    out.extend_from_slice(&perceptual_hashes[..4]);
+    let chunk_size = rolling_hash_par_chunk_size(n - 4);
+    let mut start = 4usize;
+    while start < n {
+        let end = (start + chunk_size).min(n);
+        let piece: Vec<u64> = (start..end)
+            .into_par_iter()
+            .map(|i| {
+                rolling_hash_window_fingerprint(&[
+                    perceptual_hashes[i - 4],
+                    perceptual_hashes[i - 3],
+                    perceptual_hashes[i - 2],
+                    perceptual_hashes[i - 1],
+                    perceptual_hashes[i],
+                ])
+            })
+            .collect();
+        out.extend_from_slice(&piece);
+        on_tail_end(end);
+        start = end;
+    }
+    out
+}
+
+/// Bit-identical to [`rolling_hash_analysis_vector`], but computes independent
+/// window fingerprints in parallel for long inputs (indices ≥ 4).
+pub fn rolling_hash_analysis_vector_par(perceptual_hashes: &[u64]) -> Vec<u64> {
+    rolling_hash_analysis_vector_par_with_progress(perceptual_hashes, |_| {})
 }
 
 #[cfg(test)]
@@ -147,5 +236,33 @@ mod tests {
         assert!(is_similar(0b1010, 0b1010, 0)); // Identical
         assert!(is_similar(0b1010, 0b1000, 1)); // Within threshold
         assert!(!is_similar(0b1010, 0b0101, 1)); // Beyond threshold
+    }
+
+    #[test]
+    fn parallel_rolling_analysis_matches_sequential() {
+        for len in 0..512 {
+            let v: Vec<u64> = (0..len as u64)
+                .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .collect();
+            assert_eq!(
+                rolling_hash_analysis_vector(&v),
+                rolling_hash_analysis_vector_par(&v),
+                "len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_parallel_matches_monolithic_par() {
+        for len in 512..2048 {
+            let v: Vec<u64> = (0..len as u64)
+                .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .collect();
+            assert_eq!(
+                rolling_hash_analysis_vector_par(&v),
+                rolling_hash_analysis_vector_par_with_progress(&v, |_| {}),
+                "len={len}"
+            );
+        }
     }
 }

@@ -3,78 +3,118 @@
 //! A command-line tool for removing repetitive segments from TV show episodes.
 
 use clap::Parser;
-use std::fs;
 use std::path::PathBuf;
 use tvt::parallel::process_files_parallel;
-use tvt::{Config, Result};
+use tvt::progress_display::{
+    build_json_run_summary, merged_common_segments, print_processing_summary,
+};
+use tvt::{discover_video_files, Config, Result};
 
-/// TVT - Remove repetitive segments from TV show episodes
+/// TVT — remove repetitive segments (intros, outros, credits) from TV episodes.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    name = "tvt",
+    author,
+    version,
+    about = "Remove repetitive segments from TV episodes (intro/outro/credits).",
+    long_about = None,
+    after_help = "Safety: use --dry-run to preview detection and cuts without writing outputs.\n\
+                  Scripting: --json-summary prints one JSON object on stdout; progress is suppressed.\n\
+                  Nested inputs: use -r / --recursive (skips subdirs named truncated).\n\
+                  Logs: use -v for full configuration and per-file output paths."
+)]
 struct Args {
     /// Input directory containing episodes
-    #[arg(short, long, value_name = "DIR")]
+    #[arg(short, long, value_name = "DIR", help_heading = "Input and output")]
     input: PathBuf,
 
-    /// Output directory for processed files
-    #[arg(short, long, value_name = "DIR")]
+    /// Recursively discover video files (skips subdirectories named `truncated`)
+    #[arg(short, long, help_heading = "Input and output")]
+    recursive: bool,
+
+    /// Output directory for processed files (default: <input>/truncated)
+    #[arg(short, long, value_name = "DIR", help_heading = "Input and output")]
     output: Option<PathBuf>,
 
-    /// Minimum episodes for common segment
-    #[arg(short, long, default_value = "3")]
+    /// Analyze only — no files are modified or written (preview pipeline safely)
+    #[arg(long, help_heading = "Safety")]
+    dry_run: bool,
+
+    /// Suppress banners, progress bars, and non-essential messages
+    #[arg(short, long, help_heading = "Output and logging")]
+    quiet: bool,
+
+    /// Emit one JSON object on stdout at end with paths, counts, segments (implies quiet UI)
+    #[arg(long = "json-summary", help_heading = "Output and logging")]
+    json_summary: bool,
+
+    /// Minimum episodes that must share a segment (capped to input file count when lower)
+    #[arg(short, long, default_value = "3", help_heading = "Detection")]
     threshold: usize,
 
     /// Minimum segment duration in seconds
-    #[arg(short, long, default_value = "10.0")]
+    #[arg(short, long, default_value = "10.0", help_heading = "Detection")]
     min_duration: f64,
 
     /// Similarity threshold (0-100)
-    #[arg(short, long, default_value = "90")]
+    #[arg(short, long, default_value = "90", help_heading = "Detection")]
     similarity: u8,
 
     /// Similarity threshold for detection (0.0-1.0)
-    #[arg(long, default_value = "0.75")]
+    #[arg(long, default_value = "0.75", help_heading = "Detection")]
     similarity_threshold: f64,
 
     /// Algorithm to use for video similarity detection
-    #[arg(long, value_enum, default_value = "current")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "current",
+        help_heading = "Detection"
+    )]
     algorithm: tvt::similarity::SimilarityAlgorithm,
 
     /// Algorithm to use for audio matching
-    #[arg(long, value_enum, default_value = "fingerprint")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "fingerprint",
+        help_heading = "Detection"
+    )]
     audio_algorithm: tvt::AudioAlgorithm,
 
     /// Number of parallel workers
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Performance")]
     parallel: Option<usize>,
 
-    /// Analyze only, don't process videos
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Quick mode - use 0.5fps sampling rate for faster testing
-    #[arg(long)]
+    /// Quick mode — lower sampling rate for faster runs
+    #[arg(long, help_heading = "Performance")]
     quick: bool,
 
-    /// Verbose output
-    #[arg(short, long)]
+    /// Do not prefer hardware video decoders (skip GPU decoder rank boosts; typical autoplug order)
+    #[arg(long = "no-hardware-video-decode", help_heading = "Performance")]
+    no_hardware_video_decode: bool,
+
+    /// Only detect audio segments (skip video analysis)
+    #[arg(long, help_heading = "Detection")]
+    audio_only: bool,
+
+    /// Verbose output (full configuration echo and detailed summaries)
+    #[arg(short, long, help_heading = "Output and logging")]
     verbose: bool,
 
     /// Enable debug output (shows state transitions)
-    #[arg(long)]
+    #[arg(long, help_heading = "Output and logging")]
     debug: bool,
 
     /// Enable debug output for duplicate detection (shows similarity metrics)
-    #[arg(long)]
+    #[arg(long, help_heading = "Output and logging")]
     debug_dupes: bool,
-
-    /// Only detect audio segments (skip video analysis)
-    #[arg(long)]
-    audio_only: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    let quiet = args.quiet || args.json_summary;
 
     // Validate input directory
     if !args.input.exists() {
@@ -93,7 +133,7 @@ fn main() -> Result<()> {
     });
 
     // Create configuration
-    let config = Config {
+    let mut config = Config {
         input_dir: args.input.clone(),
         output_dir: output_dir.clone(),
         threshold: args.threshold,
@@ -112,102 +152,182 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1)),
         enable_audio_matching: true, // Always enabled
         audio_only: args.audio_only,
+        quiet,
+        json_summary: args.json_summary,
     };
+
+    tvt::gstreamer_extractor_v2::set_prefer_hardware_video_decode(!args.no_hardware_video_decode);
+
+    // Find video files
+    let video_files = discover_video_files(&config.input_dir, args.recursive)?;
+
+    if !video_files.is_empty() {
+        let n = video_files.len();
+        let effective = tvt::effective_episode_threshold(config.threshold, n);
+        if effective != config.threshold {
+            eprintln!(
+                "Note: --threshold {} exceeds input file count ({}); using {}.",
+                config.threshold, n, effective
+            );
+            config.threshold = effective;
+        }
+    }
 
     if config.verbose {
         println!("Configuration: {:#?}", config);
     }
 
-    println!("TVT - TV Truncator");
-    println!("Input: {}", config.input_dir.display());
-    println!("Output: {}", config.output_dir.display());
-    println!("Threshold: {}", config.threshold);
-    println!("Min duration: {}s", config.min_duration);
-    println!("Similarity: {}%", config.similarity);
-    
-    // Check and display hardware acceleration status
-    let (hw_available, hw_description) = tvt::gstreamer_extractor_v2::check_hardware_acceleration();
-    if hw_available {
-        println!("Hardware acceleration: {} (enabled)", hw_description);
-    } else {
-        println!("Hardware acceleration: {} (will use CPU)", hw_description);
+    if !quiet && !config.json_summary {
+        print_concise_startup(&config, video_files.len());
+    } else if quiet && config.dry_run {
+        eprintln!(
+            "*** DRY RUN — no files will be written ({} video file(s) in {}) ***",
+            video_files.len(),
+            config.input_dir.display()
+        );
     }
-    
-    println!("Parallel workers: {}", config.parallel_workers);
-    println!("Dry run: {}", config.dry_run);
-    println!("Debug: {}", config.debug);
-
-    // Find video files
-    let video_files = find_video_files(&config.input_dir)?;
-    println!("\nFound {} video files", video_files.len());
 
     if video_files.is_empty() {
-        println!("No video files found in input directory");
+        if config.json_summary {
+            let summary = build_json_run_summary(&config, &[], 0);
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            println!("No video files found in input directory");
+        }
         return Ok(());
     }
 
+    emit_video_decode_banner(&config);
+    emit_optional_hw_decoder_hints(&config);
+
     // Process files using state machine
-    println!("\nStarting parallel processing with state machine...");
+    if !quiet && !config.json_summary {
+        println!("\nStarting parallel processing…");
+    }
+    let video_file_count = video_files.len();
     let config_clone = config.clone();
     let results = process_files_parallel(video_files, config)?;
 
-    // Print summary
-    use tvt::progress_display::print_summary;
-    print_summary(&results);
+    print_processing_summary(
+        &results,
+        config_clone.verbose,
+        config_clone.quiet,
+        config_clone.json_summary,
+    );
 
-    // Print segment analysis summary
     print_segment_summary(&results, &config_clone);
+
+    if config_clone.json_summary {
+        let summary = build_json_run_summary(&config_clone, &results, video_file_count);
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    }
 
     Ok(())
 }
 
-/// Find all video files in the given directory
-fn find_video_files(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
-    let mut video_files = Vec::new();
+fn print_concise_startup(config: &Config, n_videos: usize) {
+    println!(
+        "tvt: {} → {} — {} video file(s), {} worker(s){}",
+        config.input_dir.display(),
+        config.output_dir.display(),
+        n_videos,
+        config.parallel_workers,
+        if config.dry_run { ", dry-run" } else { "" }
+    );
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_file() {
-            if let Some(extension) = path.extension() {
-                if let Some(ext_str) = extension.to_str() {
-                    let ext_lower = ext_str.to_lowercase();
-                    if matches!(
-                        ext_lower.as_str(),
-                        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm"
-                    ) {
-                        video_files.push(path);
-                    }
-                }
-            }
-        }
+    if config.dry_run {
+        println!();
+        println!("*** DRY RUN — no output files will be written ***");
+        println!();
     }
+}
 
-    Ok(video_files)
+/// One line on whether video decode will prefer hardware (and if plugins are present). Skipped in
+/// `--audio-only` mode. Uses stderr when `--quiet` / `--json-summary` so stdout stays clean.
+fn emit_video_decode_banner(config: &Config) {
+    if config.audio_only {
+        return;
+    }
+    let line = format_video_decode_status();
+    if config.quiet || config.json_summary {
+        eprintln!("{}", line);
+    } else {
+        println!("{}", line);
+    }
+}
+
+/// stderr-only: list optional GStreamer hardware decoder plugins that are absent (board: call out
+/// specific missing elements that could improve performance). Always uses stderr so `--quiet` /
+/// `--json-summary` keep stdout clean.
+fn emit_optional_hw_decoder_hints(config: &Config) {
+    if config.audio_only || !tvt::gstreamer_extractor_v2::prefer_hardware_video_decode_enabled() {
+        return;
+    }
+    let (hw_available, _) = tvt::gstreamer_extractor_v2::check_hardware_acceleration();
+    let hints = tvt::gstreamer_extractor_v2::missing_optional_hw_decoder_install_hints();
+    if hints.is_empty() {
+        return;
+    }
+    if hw_available {
+        eprintln!(
+            "Video decode: optional plugins from the same GPU stack are still missing (installing them may improve decode speed for matching codecs):"
+        );
+    } else {
+        eprintln!(
+            "Video decode: optional hardware decoder plugins are missing — software decode in use; installing any of the following may improve performance:"
+        );
+    }
+    for line in hints.iter().take(6) {
+        eprintln!("  {}", line);
+    }
+    if hints.len() > 6 {
+        eprintln!("  … and {} more.", hints.len() - 6);
+    }
+}
+
+fn format_video_decode_status() -> String {
+    if !tvt::gstreamer_extractor_v2::prefer_hardware_video_decode_enabled() {
+        return "Video decode: software preference (--no-hardware-video-decode).".to_string();
+    }
+    let (hw_available, hw_description) = tvt::gstreamer_extractor_v2::check_hardware_acceleration();
+    if hw_available {
+        format!(
+            "Video decode: hardware preferred — {} decoder available.",
+            hw_description
+        )
+    } else {
+        "Video decode: software (no hardware decoder plugins found; install VA-API, NVDEC, or similar)."
+            .to_string()
+    }
 }
 
 /// Print a summary of detected identical segments
 fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor], config: &Config) {
-    // Collect all common segments from all processors
-    let mut all_segments = Vec::new();
-    for processor in processors {
-        if let Some(segments) = &processor.common_segments {
-            all_segments.extend(segments.clone());
-        }
-    }
-
-    if all_segments.is_empty() {
-        println!("\n=== Segment Analysis Summary ===");
-        println!("No identical segments found that meet the threshold criteria.");
+    if config.json_summary {
         return;
     }
 
-    // Remove duplicates (same segments might be stored in multiple processors)
-    all_segments.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
-    all_segments.dedup_by(|a, b| {
-        (a.start_time - b.start_time).abs() < 0.1 && (a.end_time - b.end_time).abs() < 0.1
-    });
+    let all_segments = merged_common_segments(processors);
+
+    if all_segments.is_empty() {
+        if config.quiet {
+            println!("Segments: none over threshold.");
+        } else {
+            println!("\n=== Segment Analysis Summary ===");
+            println!("No identical segments found that meet the threshold criteria.");
+        }
+        return;
+    }
+
+    if config.quiet {
+        let total_duration: f64 = all_segments.iter().map(|s| s.end_time - s.start_time).sum();
+        println!(
+            "Segments: {} (~{:.1}s removable)",
+            all_segments.len(),
+            total_duration
+        );
+        return;
+    }
 
     println!("\n=== Segment Analysis Summary ===");
     if config.audio_only {
@@ -233,7 +353,7 @@ fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor], confi
             tvt::format_time(duration)
         );
         println!("  Match type: {}", segment.match_type);
-        
+
         // Print separate confidence values
         match segment.match_type {
             tvt::segment_detector::MatchType::Video => {
@@ -255,7 +375,7 @@ fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor], confi
                 }
             }
         }
-        
+
         println!("  Found in {} episode(s):", segment.episode_list.len());
 
         // Show per-episode timing if available (for time-shifted segments)
@@ -264,25 +384,31 @@ fn print_segment_summary(processors: &[tvt::state_machine::FileProcessor], confi
             for timing in timings {
                 let offset = timing.start_time - segment.start_time;
                 if offset.abs() < 0.5 {
-                    println!("    - {} at {}-{}", 
+                    println!(
+                        "    - {} at {}-{}",
                         timing.episode_name,
                         tvt::format_time(timing.start_time),
-                        tvt::format_time(timing.end_time));
+                        tvt::format_time(timing.end_time)
+                    );
                 } else {
-                    println!("    - {} at {}-{} (time shift: {:+.1}s)", 
+                    println!(
+                        "    - {} at {}-{} (time shift: {:+.1}s)",
                         timing.episode_name,
                         tvt::format_time(timing.start_time),
                         tvt::format_time(timing.end_time),
-                        offset);
+                        offset
+                    );
                 }
             }
         } else {
             // No per-episode timing, show files with segment's reference timing
             for episode_name in &segment.episode_list {
-                println!("    - {} at {}-{}", 
+                println!(
+                    "    - {} at {}-{}",
                     episode_name,
                     tvt::format_time(segment.start_time),
-                    tvt::format_time(segment.end_time));
+                    tvt::format_time(segment.end_time)
+                );
             }
         }
         println!();

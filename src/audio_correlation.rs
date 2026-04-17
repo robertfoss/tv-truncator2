@@ -84,12 +84,8 @@ pub fn detect_audio_segments_correlation(
     }
 
     // Group matches into common segments
-    let common_segments = group_matches_into_segments(
-        &potential_matches,
-        episode_audio,
-        config,
-        debug_dupes,
-    )?;
+    let common_segments =
+        group_matches_into_segments(&potential_matches, episode_audio, config, debug_dupes)?;
 
     if debug_dupes {
         println!(
@@ -136,11 +132,16 @@ fn find_matching_segments_between_episodes(
             .iter()
             .map(|f| f.spectral_hash)
             .collect();
-        
+
         // Debug: print every 50 iterations to see progress
         if debug_dupes && iteration % 50 == 0 {
             let t = ep1.audio_frames[pos1].timestamp;
-            println!("    Iteration {}: scanning ep1 at {:.1}s ({:.1} min)", iteration, t, t / 60.0);
+            println!(
+                "    Iteration {}: scanning ep1 at {:.1}s ({:.1} min)",
+                iteration,
+                t,
+                t / 60.0
+            );
         }
 
         // Find best match in ep2 using cross-correlation
@@ -201,8 +202,12 @@ fn find_matching_segments_between_episodes(
         } else {
             0.0
         };
-        println!("    Completed {} iterations, scanned up to {:.1}s ({:.1} min)",
-            iteration, final_time, final_time / 60.0);
+        println!(
+            "    Completed {} iterations, scanned up to {:.1}s ({:.1} min)",
+            iteration,
+            final_time,
+            final_time / 60.0
+        );
         println!("    Found {} matches", matches.len());
     }
 
@@ -316,8 +321,8 @@ fn group_matches_into_segments(
 
         if episode_ids.len() >= config.threshold {
             // Calculate average timing
-            let avg_start = group.iter().map(|m| m.start1.min(m.start2)).sum::<f64>()
-                / group.len() as f64;
+            let avg_start =
+                group.iter().map(|m| m.start1.min(m.start2)).sum::<f64>() / group.len() as f64;
             let avg_end =
                 group.iter().map(|m| m.end1.max(m.end2)).sum::<f64>() / group.len() as f64;
             let avg_correlation =
@@ -383,4 +388,3 @@ mod tests {
         assert_eq!(corr2, 0.8); // 80% match
     }
 }
-

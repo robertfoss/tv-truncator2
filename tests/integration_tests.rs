@@ -9,7 +9,7 @@ fn test_cli_help() {
     let mut cmd = Command::cargo_bin("tvt").unwrap();
     cmd.arg("--help");
     cmd.assert().success().stdout(predicate::str::contains(
-        "TV Truncator - Remove repetitive segments",
+        "Remove repetitive segments from TV episodes",
     ));
 }
 
@@ -39,7 +39,7 @@ fn test_cli_valid_input() {
 
     let mut cmd = Command::cargo_bin("tvt").unwrap();
     cmd.arg("--input").arg(temp_dir.path());
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("TVT - TV Truncator"));
+    cmd.assert().success().stdout(predicate::str::contains(
+        "No video files found in input directory",
+    ));
 }

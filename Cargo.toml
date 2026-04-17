@@ -2,6 +2,7 @@
 name = "tvt"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "TV Truncator - Remove repetitive segments from TV show episodes"
 authors = ["Robert Foss <robert@example.com>"]
 
@@ -48,3 +49,8 @@ ffmpeg = []  # Keep old code path as fallback
 tempfile = "3.10"
 assert_cmd = "2.0"
 predicates = "3.0"
+criterion = "0.5"
+
+[[bench]]
+name = "hot_paths"
+harness = false

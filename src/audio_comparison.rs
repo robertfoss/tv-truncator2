@@ -63,7 +63,7 @@ pub fn compare_all_algorithms(
         }
 
         let result = run_algorithm(algorithm, episode_audio, config, debug)?;
-        
+
         let metrics = if let Some(ref error) = result.error {
             if debug {
                 println!("  ❌ Error: {}", error);
@@ -147,12 +147,15 @@ fn calculate_metrics(
             result.segments.len(),
             result.execution_time_ms as f64 / 1000.0
         );
-        
+
         // Show segment details with confidence
         for (i, seg) in result.segments.iter().enumerate() {
             println!(
                 "    Segment {}: {:.1}s-{:.1}s ({} episodes, confidence={:.2})",
-                i, seg.start_time, seg.end_time, seg.episode_list.len(),
+                i,
+                seg.start_time,
+                seg.end_time,
+                seg.episode_list.len(),
                 seg.audio_confidence.unwrap_or(seg.confidence)
             );
         }
@@ -271,10 +274,7 @@ fn calculate_precision_recall(
 }
 
 /// Calculate average timing accuracy (how close detected times are to expected)
-fn calculate_timing_accuracy(
-    detected: &[CommonSegment],
-    expected: &[ExpectedSegment],
-) -> f64 {
+fn calculate_timing_accuracy(detected: &[CommonSegment], expected: &[ExpectedSegment]) -> f64 {
     let mut total_error = 0.0;
     let mut count = 0;
 
@@ -311,8 +311,10 @@ pub fn print_comparison_report(metrics: &[ComparisonMetrics]) {
     println!("║           Audio Algorithm Comparison Report                   ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
 
-    println!("\n{:<15} {:<10} {:<10} {:<10} {:<12} {:<12} {:<10}",
-             "Algorithm", "Precision", "Recall", "F1 Score", "Time (ms)", "Timing Err", "Segments");
+    println!(
+        "\n{:<15} {:<10} {:<10} {:<10} {:<12} {:<12} {:<10}",
+        "Algorithm", "Precision", "Recall", "F1 Score", "Time (ms)", "Timing Err", "Segments"
+    );
     println!("{}", "-".repeat(85));
 
     for metric in metrics {
@@ -334,7 +336,10 @@ pub fn print_comparison_report(metrics: &[ComparisonMetrics]) {
             .partial_cmp(&b.f1_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     }) {
-        println!("\n🏆 Best F1 Score: {:?} ({:.2})", best_f1.algorithm, best_f1.f1_score);
+        println!(
+            "\n🏆 Best F1 Score: {:?} ({:.2})",
+            best_f1.algorithm, best_f1.f1_score
+        );
     }
 
     if let Some(fastest) = metrics.iter().min_by_key(|m| m.execution_time_ms) {
@@ -380,4 +385,3 @@ mod tests {
         assert_eq!(accuracy, 0.0);
     }
 }
-

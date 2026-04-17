@@ -1,0 +1,17 @@
+{
+  "test_name": "mid_segment",
+  "description": "Three files with identical mid segment",
+  "files": [
+  "video1.mkv",
+  "video2.mkv",
+  "video3.mkv"
+],
+  "expected_segments": [
+  {
+    "segment_id": "mid",
+    "start_time": 26.0,
+    "end_time": 47.0,
+    "files": ["video1.mkv", "video2.mkv", "video3.mkv"]
+  }
+]
+}

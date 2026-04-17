@@ -2,6 +2,7 @@
 
 use crate::analyzer::EpisodeFrames;
 use crate::audio_extractor::EpisodeAudio;
+use crate::hamming_bk_tree::HammingBkTree;
 use crate::hasher::{hamming_distance, RollingHash};
 use crate::similarity::{
     calculate_adaptive_threshold, calculate_similarity_score, compute_ssim_from_features,
@@ -42,11 +43,11 @@ pub struct EpisodeSegmentTiming {
 /// Represents a common segment found across multiple episodes
 #[derive(Debug, Clone)]
 pub struct CommonSegment {
-    pub start_time: f64,      // Reference time (first episode or average)
-    pub end_time: f64,        // Reference end time
+    pub start_time: f64, // Reference time (first episode or average)
+    pub end_time: f64,   // Reference end time
     pub episode_list: Vec<String>,
     pub episode_timings: Option<Vec<EpisodeSegmentTiming>>, // Per-episode timing for time-shifted segments
-    pub confidence: f64,      // Overall confidence (for sorting/filtering)
+    pub confidence: f64, // Overall confidence (for sorting/filtering)
     pub video_confidence: Option<f64>, // Video matching confidence (if video matched)
     pub audio_confidence: Option<f64>, // Audio matching confidence (if audio matched)
     pub match_type: MatchType,
@@ -61,29 +62,116 @@ pub struct SequenceHash {
     end_time: f64,
 }
 
-/// Detect common segments across episodes using rolling hash
+/// Throttles and monotonic-clamps duplicate-detection progress so TUI/CLI bars stay responsive
+/// without excessive mutex traffic.
+struct ThrottledDuplicateProgress<'a> {
+    cb: Option<&'a mut dyn FnMut(f64)>,
+    last_sent: f64,
+    min_step: f64,
+}
+
+impl<'a> ThrottledDuplicateProgress<'a> {
+    fn new(cb: Option<&'a mut dyn FnMut(f64)>) -> Self {
+        Self {
+            cb,
+            last_sent: -1.0,
+            min_step: 0.02,
+        }
+    }
+
+    /// `t` in \[0, 1\], non-decreasing across the whole detection run.
+    fn report(&mut self, t: f64) {
+        let Some(cb) = self.cb.as_mut() else {
+            return;
+        };
+        let mut t = t.clamp(0.0, 1.0);
+        if self.last_sent >= 0.0 {
+            t = t.max(self.last_sent);
+        }
+        if self.last_sent < 0.0 || t >= 1.0 - 1e-9 || t - self.last_sent >= self.min_step {
+            cb(t);
+            self.last_sent = t;
+        }
+    }
+
+    fn report_span(&mut self, span_lo: f64, span_hi: f64, local: f64) {
+        let local = local.clamp(0.0, 1.0);
+        let t = span_lo + (span_hi - span_lo) * local;
+        self.report(t);
+    }
+}
+
+/// Maps local \[0, 1\] progress into a sub-range of the root duplicate-detection progress.
+struct ScopedDuplicateProgress<'b, 'a: 'b> {
+    inner: &'b mut ThrottledDuplicateProgress<'a>,
+    lo: f64,
+    hi: f64,
+}
+
+impl<'b, 'a> ScopedDuplicateProgress<'b, 'a> {
+    fn full(inner: &'b mut ThrottledDuplicateProgress<'a>) -> Self {
+        Self {
+            inner,
+            lo: 0.0,
+            hi: 1.0,
+        }
+    }
+
+    fn report(&mut self, local: f64) {
+        self.inner.report_span(self.lo, self.hi, local);
+    }
+
+    fn report_span(&mut self, inner_lo: f64, inner_hi: f64, local: f64) {
+        let local = local.clamp(0.0, 1.0);
+        let mapped = inner_lo + (inner_hi - inner_lo) * local;
+        self.report(mapped);
+    }
+}
+
+/// Detect common segments across episodes using rolling hash.
+///
+/// `on_progress` receives values in \[0, 1\] (best-effort monotonic) while detection runs.
 pub fn detect_common_segments(
     episode_frames: &[EpisodeFrames],
     config: &crate::Config,
     debug_dupes: bool,
+    on_progress: Option<&mut dyn FnMut(f64)>,
 ) -> Result<Vec<CommonSegment>> {
-    match config.similarity_algorithm {
+    let mut throttled = ThrottledDuplicateProgress::new(on_progress);
+    let out = match config.similarity_algorithm {
         SimilarityAlgorithm::Current => {
-            detect_with_current_algorithm(episode_frames, config, debug_dupes)
+            let mut scoped = ScopedDuplicateProgress::full(&mut throttled);
+            detect_with_current_algorithm(episode_frames, config, debug_dupes, &mut scoped)
         }
         SimilarityAlgorithm::MultiHash => {
-            detect_with_multi_hash(episode_frames, config, debug_dupes)
+            let mut scoped = ScopedDuplicateProgress::full(&mut throttled);
+            detect_with_multi_hash(episode_frames, config, debug_dupes, &mut scoped)
         }
         SimilarityAlgorithm::SsimFeatures => {
-            detect_with_ssim_features(episode_frames, config, debug_dupes)
+            let mut scoped = ScopedDuplicateProgress::full(&mut throttled);
+            detect_with_ssim_features(episode_frames, config, debug_dupes, &mut scoped)
         }
         SimilarityAlgorithm::Both => {
-            let results1 = detect_with_multi_hash(episode_frames, config, debug_dupes)?;
-            let _results2 = detect_with_ssim_features(episode_frames, config, debug_dupes)?;
-            // For now, return multi-hash results (comparison will be implemented later)
+            let mut first = ScopedDuplicateProgress {
+                inner: &mut throttled,
+                lo: 0.0,
+                hi: 0.5,
+            };
+            let results1 = detect_with_multi_hash(episode_frames, config, debug_dupes, &mut first)?;
+            let mut second = ScopedDuplicateProgress {
+                inner: &mut throttled,
+                lo: 0.5,
+                hi: 1.0,
+            };
+            let _results2 =
+                detect_with_ssim_features(episode_frames, config, debug_dupes, &mut second)?;
             Ok(results1)
         }
+    };
+    if out.is_ok() {
+        throttled.report(1.0);
     }
+    out
 }
 
 /// Detect using current algorithm (existing implementation)
@@ -91,13 +179,17 @@ fn detect_with_current_algorithm(
     episode_frames: &[EpisodeFrames],
     config: &crate::Config,
     debug_dupes: bool,
+    progress: &mut ScopedDuplicateProgress<'_, '_>,
 ) -> Result<Vec<CommonSegment>> {
+    progress.report(0.0);
     // First, check for fully identical videos
     if let Some(full_duplicate_segments) =
         detect_full_video_duplicates(episode_frames, config, debug_dupes)?
     {
+        progress.report(1.0);
         return Ok(full_duplicate_segments);
     }
+    progress.report_span(0.0, 0.12, 0.5);
 
     // Don't do early-return opening detection - let main algorithm find all segments
     // including time-shifted ones
@@ -118,11 +210,29 @@ fn detect_with_current_algorithm(
     // For opening segment detection, also try with a very small window size
     let opening_window_size = 3;
 
+    let opening_extra: u64 = if opening_window_size < window_size {
+        episode_frames.iter().map(|e| e.frames.len() as u64).sum()
+    } else {
+        0
+    };
+    let total_hash_work: u64 = episode_frames
+        .iter()
+        .map(|e| e.frames.len() as u64)
+        .sum::<u64>()
+        + opening_extra;
+    let mut hash_work_done: u64 = 0;
+
     // Generate rolling hashes for each episode
     for (episode_id, episode) in episode_frames.iter().enumerate() {
         let mut rolling_hash = RollingHash::new(window_size);
 
         for (i, frame) in episode.frames.iter().enumerate() {
+            hash_work_done += 1;
+            if total_hash_work > 0
+                && (hash_work_done % 4096 == 0 || hash_work_done == total_hash_work)
+            {
+                progress.report_span(0.12, 0.30, hash_work_done as f64 / total_hash_work as f64);
+            }
             if let Some(_hash) = rolling_hash.add(frame.perceptual_hash) {
                 let start_time = if i + 1 >= window_size {
                     episode.frames[i + 1 - window_size].timestamp
@@ -144,6 +254,16 @@ fn detect_with_current_algorithm(
             let mut opening_hash = RollingHash::new(opening_window_size);
 
             for (i, frame) in episode.frames.iter().enumerate() {
+                hash_work_done += 1;
+                if total_hash_work > 0
+                    && (hash_work_done % 4096 == 0 || hash_work_done == total_hash_work)
+                {
+                    progress.report_span(
+                        0.12,
+                        0.30,
+                        hash_work_done as f64 / total_hash_work as f64,
+                    );
+                }
                 if let Some(_hash) = opening_hash.add(frame.perceptual_hash) {
                     let start_time = if i + 1 >= opening_window_size {
                         episode.frames[i + 1 - opening_window_size].timestamp
@@ -162,32 +282,40 @@ fn detect_with_current_algorithm(
         }
     }
 
-    // Group sequences by similar hashes (using Hamming distance)
+    // Group sequences by similar hashes (using Hamming distance).
+    // Index representatives in a BK-tree so we do not scan every group per sequence.
     let mut hash_groups: HashMap<u64, Vec<SequenceHash>> = HashMap::new();
     let similarity_threshold = config.similarity_threshold;
+    let max_distance = (64.0 * (1.0 - similarity_threshold)) as u32;
+    let mut rep_tree = HammingBkTree::new();
 
-    for seq in sequence_hashes {
-        // Try to find an existing group with similar hash
+    let seq_total = sequence_hashes.len().max(1);
+    for (seq_idx, seq) in sequence_hashes.into_iter().enumerate() {
+        if seq_idx % 512 == 0 || seq_idx + 1 == seq_total {
+            progress.report_span(0.30, 0.52, seq_idx as f64 / seq_total as f64);
+        }
+        let mut candidates = Vec::new();
+        rep_tree.search_within(seq.hash, max_distance, &mut candidates);
+
         let mut target_group_hash = None;
-
-        for (group_hash, group_sequences) in hash_groups.iter() {
-            if let Some(first_seq) = group_sequences.first() {
-                // Calculate Hamming distance between hashes
-                let hamming_dist = hamming_distance(seq.hash, first_seq.hash);
-                let max_distance = (64.0 * (1.0 - similarity_threshold)) as u32;
-
-                if hamming_dist <= max_distance {
-                    target_group_hash = Some(*group_hash);
-                    break;
-                }
+        let mut best_dist = u32::MAX;
+        for &rep in &candidates {
+            if !hash_groups.contains_key(&rep) {
+                continue;
+            }
+            let hamming_dist = hamming_distance(seq.hash, rep);
+            if hamming_dist <= max_distance && hamming_dist < best_dist {
+                best_dist = hamming_dist;
+                target_group_hash = Some(rep);
             }
         }
 
-        // Add to existing group or create new one
         if let Some(group_hash) = target_group_hash {
             hash_groups.get_mut(&group_hash).unwrap().push(seq);
         } else {
-            hash_groups.insert(seq.hash, vec![seq]);
+            let key = seq.hash;
+            hash_groups.insert(key, vec![seq]);
+            rep_tree.insert(key);
         }
     }
 
@@ -293,7 +421,11 @@ fn detect_with_current_algorithm(
     // Find sequences that appear in enough episodes
     let mut common_segments = Vec::new();
 
-    for (_hash, sequences) in hash_groups {
+    let group_total = hash_groups.len().max(1);
+    for (group_idx, (_hash, sequences)) in hash_groups.into_iter().enumerate() {
+        if group_idx % 64 == 0 || group_idx + 1 == group_total {
+            progress.report_span(0.52, 0.78, group_idx as f64 / group_total as f64);
+        }
         if sequences.len() >= config.threshold {
             // Group by episode to avoid duplicates
             let mut episode_segments: HashMap<usize, Vec<&SequenceHash>> = HashMap::new();
@@ -362,6 +494,7 @@ fn detect_with_current_algorithm(
         }
     }
 
+    progress.report_span(0.78, 0.88, 0.5);
     // Apply deduplication and merge overlapping segments
     let deduplicated_segments = deduplicate_similar_segments(common_segments);
     let mut merged_segments = merge_overlapping_segments(deduplicated_segments);
@@ -372,7 +505,8 @@ fn detect_with_current_algorithm(
         if debug_dupes {
             println!("  Normal detection found nothing, trying time-shift tolerant detection...");
         }
-        let time_shifted = detect_time_shifted_segments(episode_frames, config, debug_dupes)?;
+        let time_shifted =
+            detect_time_shifted_segments(episode_frames, config, debug_dupes, progress)?;
         merged_segments.extend(time_shifted);
         merged_segments = merge_overlapping_segments(merged_segments);
     }
@@ -381,16 +515,18 @@ fn detect_with_current_algorithm(
     let mut final_segments = merged_segments;
     final_segments.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
+    progress.report(1.0);
     Ok(final_segments)
 }
 
 /// Detect time-shifted matching segments (for ending credits that start at different times)
-/// 
+///
 /// Uses a hash map to track per-episode timing independently
 fn detect_time_shifted_segments(
     episode_frames: &[EpisodeFrames],
     config: &crate::Config,
     debug_dupes: bool,
+    progress: &mut ScopedDuplicateProgress<'_, '_>,
 ) -> Result<Vec<CommonSegment>> {
     if episode_frames.len() < 2 {
         return Ok(Vec::new());
@@ -399,11 +535,12 @@ fn detect_time_shifted_segments(
     // Use adaptive chunk size based on video length
     // For long videos (>10min), use 60s chunks to detect endings accurately
     // For short videos, use min_duration
-    let max_video_duration = episode_frames.iter()
+    let max_video_duration = episode_frames
+        .iter()
         .filter_map(|ep| ep.frames.last())
         .map(|f| f.timestamp)
         .fold(0.0f64, f64::max);
-    
+
     let min_chunk_frames = if max_video_duration > 600.0 {
         // Long videos: use 60s chunks for better ending detection
         ((config.min_duration * 5.0) as usize).max(300)
@@ -411,6 +548,26 @@ fn detect_time_shifted_segments(
         // Short videos: use min_duration
         ((config.min_duration * 5.0) as usize).max(50)
     };
+
+    let mut est_anchor_iters: u64 = 0;
+    for i in 0..episode_frames.len() {
+        for j in (i + 1)..episode_frames.len() {
+            let ep1 = &episode_frames[i];
+            let ep2 = &episode_frames[j];
+            let max_pair_len = ep1.frames.len().max(ep2.frames.len());
+            let step_size = if max_pair_len > 8000 {
+                (max_pair_len / 300).max(20)
+            } else if ep1.frames.len() > 1000 {
+                5
+            } else {
+                25
+            };
+            let anchors = ep1.frames.len().saturating_sub(min_chunk_frames) / step_size.max(1);
+            est_anchor_iters += anchors as u64 + 1;
+        }
+    }
+    let est_anchor_iters = est_anchor_iters.max(1);
+    let mut done_anchor_iters: u64 = 0;
 
     // Track per-episode timing for matching content: episode_id -> Vec<(start, end, confidence)>
     // Store all matching regions separately, then merge only contiguous ones
@@ -422,34 +579,91 @@ fn detect_time_shifted_segments(
             let ep1 = &episode_frames[i];
             let ep2 = &episode_frames[j];
 
-            // Scan very thoroughly for longer videos (every 5 frames = 1 second at 5fps)
-            // This finds precise segment boundaries
-            let step_size = if ep1.frames.len() > 1000 { 5 } else { 25 };
-            
-            for start1 in (0..ep1.frames.len().saturating_sub(min_chunk_frames)).step_by(step_size) {
+            let max_pair_len = ep1.frames.len().max(ep2.frames.len());
+            // Long sources: subsample anchor positions so this path stays tractable.
+            let step_size = if max_pair_len > 8000 {
+                (max_pair_len / 300).max(20)
+            } else if ep1.frames.len() > 1000 {
+                5
+            } else {
+                25
+            };
+
+            let ep2_scan_end = ep2.frames.len().saturating_sub(min_chunk_frames);
+            let inner_stride = if ep2_scan_end > 2000 {
+                (ep2_scan_end / 800).max(4)
+            } else if ep2_scan_end > 600 {
+                3
+            } else {
+                1
+            };
+
+            for start1 in (0..ep1.frames.len().saturating_sub(min_chunk_frames)).step_by(step_size)
+            {
+                done_anchor_iters += 1;
+                if done_anchor_iters % 256 == 0 || done_anchor_iters == est_anchor_iters {
+                    progress.report_span(
+                        0.88,
+                        1.0,
+                        done_anchor_iters as f64 / est_anchor_iters as f64,
+                    );
+                }
                 let chunk1 = &ep1.frames[start1..start1 + min_chunk_frames];
                 let t1_start = ep1.frames[start1].timestamp;
 
-                // Find best match in ep2, but prefer matches at similar timestamps (±5s)
-                let mut best_idx2 = 0;
+                // Find best match in ep2 (coarse scan, then local refine).
+                let mut best_idx2 = 0usize;
                 let mut best_dist = u32::MAX;
 
-                for idx2 in 0..ep2.frames.len().saturating_sub(min_chunk_frames) {
+                let mut idx2 = 0usize;
+                while idx2 < ep2_scan_end {
                     let chunk2 = &ep2.frames[idx2..idx2 + min_chunk_frames];
                     let mut total_dist = 0u32;
                     for k in 0..min_chunk_frames {
-                        total_dist += hamming_distance(chunk1[k].perceptual_hash, chunk2[k].perceptual_hash);
+                        total_dist +=
+                            hamming_distance(chunk1[k].perceptual_hash, chunk2[k].perceptual_hash);
                     }
-                    
-                    // Prefer matches at similar timestamps (small time offset bonus)
+
                     let t2_start = ep2.frames[idx2].timestamp;
                     let time_offset = (t2_start - t1_start).abs();
-                    let time_penalty = if time_offset < 5.0 { 0 } else { (time_offset as u32) / 2 };
+                    let time_penalty = if time_offset < 5.0 {
+                        0
+                    } else {
+                        (time_offset as u32) / 2
+                    };
                     let adjusted_dist = total_dist + time_penalty;
-                    
+
                     if adjusted_dist < best_dist {
-                        best_dist = total_dist; // Use original distance for threshold check
+                        best_dist = total_dist;
                         best_idx2 = idx2;
+                    }
+                    idx2 += inner_stride;
+                }
+
+                if inner_stride > 1 && ep2_scan_end > 0 {
+                    let refine_lo = best_idx2.saturating_sub(inner_stride.saturating_mul(3));
+                    let refine_hi = (best_idx2 + inner_stride.saturating_mul(3)).min(ep2_scan_end);
+                    for idx2 in refine_lo..refine_hi {
+                        let chunk2 = &ep2.frames[idx2..idx2 + min_chunk_frames];
+                        let mut total_dist = 0u32;
+                        for k in 0..min_chunk_frames {
+                            total_dist += hamming_distance(
+                                chunk1[k].perceptual_hash,
+                                chunk2[k].perceptual_hash,
+                            );
+                        }
+                        let t2_start = ep2.frames[idx2].timestamp;
+                        let time_offset = (t2_start - t1_start).abs();
+                        let time_penalty = if time_offset < 5.0 {
+                            0
+                        } else {
+                            (time_offset as u32) / 2
+                        };
+                        let adjusted_dist = total_dist + time_penalty;
+                        if adjusted_dist < best_dist {
+                            best_dist = total_dist;
+                            best_idx2 = idx2;
+                        }
                     }
                 }
 
@@ -457,15 +671,15 @@ fn detect_time_shifted_segments(
                 // Use balanced thresholds: strict enough to avoid spurious matches,
                 // lenient enough for real-world encoded video endings (6-7 bits/frame typical)
                 let threshold = if min_chunk_frames >= 300 {
-                    6.5  // 60+ second chunks: allow up to 6.5 bits/frame
+                    6.5 // 60+ second chunks: allow up to 6.5 bits/frame
                 } else if min_chunk_frames >= 250 {
-                    6.0  // 50+ second chunks: allow up to 6 bits/frame  
+                    6.0 // 50+ second chunks: allow up to 6 bits/frame
                 } else if min_chunk_frames >= 150 {
-                    6.5  // 30+ second chunks: allow up to 6.5 bits/frame (for encoded endings)
+                    6.5 // 30+ second chunks: allow up to 6.5 bits/frame (for encoded endings)
                 } else {
-                    3.0  // < 30 second chunks: strict 3 bits/frame
+                    3.0 // < 30 second chunks: strict 3 bits/frame
                 };
-                
+
                 if avg_dist < threshold {
                     let t1_end = ep1.frames[start1 + min_chunk_frames - 1].timestamp;
                     let t2_start = ep2.frames[best_idx2].timestamp;
@@ -477,7 +691,7 @@ fn detect_time_shifted_segments(
                         .entry(i)
                         .or_insert_with(Vec::new)
                         .push((t1_start, t1_end, confidence));
-                    
+
                     episode_match_regions
                         .entry(j)
                         .or_insert_with(Vec::new)
@@ -493,15 +707,30 @@ fn detect_time_shifted_segments(
     for (ep_id, mut regions) in episode_match_regions {
         // Sort regions by start time
         regions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        
+
         if debug_dupes && ep_id <= 1 {
-            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
-            println!("    DEBUG: Episode {} ({}) has {} raw match regions:", ep_id, ep_name, regions.len());
+            let ep_name = episode_frames[ep_id]
+                .episode_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
+            println!(
+                "    DEBUG: Episode {} ({}) has {} raw match regions:",
+                ep_id,
+                ep_name,
+                regions.len()
+            );
             for (idx, (s, e, conf)) in regions.iter().take(25).enumerate() {
-                println!("      Raw {}: {:.1}s-{:.1}s (conf={:.1}%)", idx, s, e, conf * 100.0);
+                println!(
+                    "      Raw {}: {:.1}s-{:.1}s (conf={:.1}%)",
+                    idx,
+                    s,
+                    e,
+                    conf * 100.0
+                );
             }
         }
-        
+
         // Merge overlapping regions sequentially (keeps chronological order)
         let mut merged_regions = Vec::new();
         let mut current_start = regions[0].0;
@@ -518,43 +747,64 @@ fn detect_time_shifted_segments(
                 current_count += 1;
             } else {
                 // Significant gap (>5s), save current and start new
-                merged_regions.push((current_start, current_end, current_conf_sum / current_count as f64));
+                merged_regions.push((
+                    current_start,
+                    current_end,
+                    current_conf_sum / current_count as f64,
+                ));
                 current_start = region.0;
                 current_end = region.1;
                 current_conf_sum = region.2;
                 current_count = 1;
             }
         }
-        merged_regions.push((current_start, current_end, current_conf_sum / current_count as f64));
+        merged_regions.push((
+            current_start,
+            current_end,
+            current_conf_sum / current_count as f64,
+        ));
 
         if debug_dupes && ep_id == 0 {
-            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
-            println!("    DEBUG: Episode {} ({}) merged regions BEFORE 30s filter:", ep_id, ep_name);
+            let ep_name = episode_frames[ep_id]
+                .episode_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
+            println!(
+                "    DEBUG: Episode {} ({}) merged regions BEFORE 30s filter:",
+                ep_id, ep_name
+            );
             for (idx, (s, e, conf)) in merged_regions.iter().enumerate() {
-                println!("      Merged {}: {:.1}s-{:.1}s ({:.1}s duration, conf={:.1}%)",
-                    idx, s, e, e - s, conf * 100.0);
+                println!(
+                    "      Merged {}: {:.1}s-{:.1}s ({:.1}s duration, conf={:.1}%)",
+                    idx,
+                    s,
+                    e,
+                    e - s,
+                    conf * 100.0
+                );
             }
         }
 
         // Filter merged regions: only keep those with substantial duration (> 20s)
         // This filters out spurious short matches while allowing real segments
         merged_regions.retain(|(s, e, _)| (e - s) >= 20.0);
-        
+
         // Trim opening and ending segments to proper durations
         for (start, end, _conf) in &mut merged_regions {
             let duration = *end - *start;
-            
+
             // Check if this is an opening segment (starts near beginning)
             let might_be_opening = *start < 30.0 && *end < 500.0;
-            
+
             // Trim opening to 90s (1:30) - standard anime opening theme duration
             if might_be_opening && duration > 90.0 {
                 *end = *start + 90.0;
             }
-            
+
             // Check if this might be an ending segment (within last 3 minutes of episode)
             let might_be_ending = *start > 1300.0 && *end > 1400.0;
-            
+
             // Trim ending to 70s - standard anime ending credits duration
             if might_be_ending && duration > 70.0 {
                 *start = *end - 70.0;
@@ -563,7 +813,7 @@ fn detect_time_shifted_segments(
                 *start = *end; // Mark as empty (will be filtered)
             }
         }
-        
+
         // Remove empty regions
         merged_regions.retain(|(s, e, _)| e > s);
 
@@ -572,12 +822,26 @@ fn detect_time_shifted_segments(
         }
 
         if debug_dupes && ep_id <= 1 {
-            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
-            println!("    DEBUG: Episode {} ({}) has {} substantial regions (after filtering >30s):", 
-                ep_id, ep_name, merged_regions.len());
+            let ep_name = episode_frames[ep_id]
+                .episode_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
+            println!(
+                "    DEBUG: Episode {} ({}) has {} substantial regions (after filtering >30s):",
+                ep_id,
+                ep_name,
+                merged_regions.len()
+            );
             for (idx, (s, e, conf)) in merged_regions.iter().enumerate() {
-                println!("      Region {}: {:.1}s-{:.1}s ({:.1}s duration, conf={:.1}%)",
-                    idx, s, e, e - s, conf * 100.0);
+                println!(
+                    "      Region {}: {:.1}s-{:.1}s ({:.1}s duration, conf={:.1}%)",
+                    idx,
+                    s,
+                    e,
+                    e - s,
+                    conf * 100.0
+                );
             }
         }
 
@@ -591,16 +855,25 @@ fn detect_time_shifted_segments(
         }
 
         if debug_dupes {
-            let ep_name = episode_frames[ep_id].episode_path.file_name().unwrap().to_string_lossy();
-            println!("    Episode {} ({}): stored {} regions", ep_id, ep_name, 
-                episode_ranges.get(&ep_id).map(|v| v.len()).unwrap_or(0));
+            let ep_name = episode_frames[ep_id]
+                .episode_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
+            println!(
+                "    Episode {} ({}): stored {} regions",
+                ep_id,
+                ep_name,
+                episode_ranges.get(&ep_id).map(|v| v.len()).unwrap_or(0)
+            );
         }
     }
 
     // Create segments by grouping episodes that have overlapping regions
     // This properly handles multiple disjoint segments (intro AND outro)
     let mut segments = Vec::new();
-    let mut used_regions: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut used_regions: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
 
     for (ep_id1, regions1) in &episode_ranges {
         for (region_idx1, (start1, end1, conf1)) in regions1.iter().enumerate() {
@@ -661,11 +934,15 @@ fn detect_time_shifted_segments(
                 }
 
                 // Sort by start time
-                episode_timing_info.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+                episode_timing_info
+                    .sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
 
                 // Use earliest start as reference
                 let ref_start = episode_timing_info.first().unwrap().start_time;
-                let ref_end = episode_timing_info.iter().map(|t| t.end_time).fold(0.0f64, f64::max);
+                let ref_end = episode_timing_info
+                    .iter()
+                    .map(|t| t.end_time)
+                    .fold(0.0f64, f64::max);
 
                 let avg_confidence = conf_sum / matching_episodes.len() as f64;
 
@@ -705,42 +982,57 @@ fn detect_time_shifted_segments(
     // Filter out spurious middle-of-video matches
     // Keep only segments that are well-separated (intro, outro, not random middle content)
     if debug_dupes {
-        println!("  Time-shift detection created {} segments before filtering", segments.len());
+        println!(
+            "  Time-shift detection created {} segments before filtering",
+            segments.len()
+        );
     }
-    
+
     if segments.len() > 2 {
         // Sort by start time
         segments.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
-        
+
         if debug_dupes {
             println!("  Filtering spurious middle segments (keeping ONLY first and last)...");
             for (i, seg) in segments.iter().enumerate() {
-                println!("    Segment {}: {:.1}s-{:.1}s ({:.1}s)", i, seg.start_time, seg.end_time, seg.end_time - seg.start_time);
+                println!(
+                    "    Segment {}: {:.1}s-{:.1}s ({:.1}s)",
+                    i,
+                    seg.start_time,
+                    seg.end_time,
+                    seg.end_time - seg.start_time
+                );
             }
         }
-        
+
         // Keep ONLY first (intro) and last (outro) segments
         // Discard all middle segments (spurious matches)
         let mut filtered = Vec::new();
         if let Some(first) = segments.first() {
             filtered.push(first.clone());
             if debug_dupes {
-                println!("  → Keeping first: {:.1}s-{:.1}s", first.start_time, first.end_time);
+                println!(
+                    "  → Keeping first: {:.1}s-{:.1}s",
+                    first.start_time, first.end_time
+                );
             }
         }
         if let Some(last) = segments.last() {
             if last.start_time != segments.first().unwrap().start_time {
                 filtered.push(last.clone());
                 if debug_dupes {
-                    println!("  → Keeping last: {:.1}s-{:.1}s", last.start_time, last.end_time);
+                    println!(
+                        "  → Keeping last: {:.1}s-{:.1}s",
+                        last.start_time, last.end_time
+                    );
                 }
             }
         }
-        
+
         if debug_dupes {
             println!("  After filtering: {} segments", filtered.len());
         }
-        
+
         segments = filtered;
     }
 
@@ -845,6 +1137,200 @@ fn detect_opening_segments(
     Ok(None)
 }
 
+/// Minimum fraction of sampled frames that must match between two episodes to treat them
+/// as the same full-video duplicate (allows tiny decode/hash noise).
+const FULL_VIDEO_IDENTITY_MIN_RATIO: f64 = 0.95;
+
+/// Frame indices used when comparing two episodes for full-file identity.
+fn identity_sample_indices(frame_count: usize) -> Vec<usize> {
+    if frame_count == 0 {
+        return Vec::new();
+    }
+    if frame_count <= 30 {
+        return (0..frame_count).collect();
+    }
+    let mut indices = Vec::new();
+    indices.extend(0..10.min(frame_count));
+    let middle_start = frame_count / 2 - 5;
+    indices.extend(middle_start..(middle_start + 10).min(frame_count));
+    let last_start = frame_count.saturating_sub(10);
+    indices.extend(last_start..frame_count);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn pairwise_identity_match_ratio(
+    a: &EpisodeFrames,
+    b: &EpisodeFrames,
+    sample_indices: &[usize],
+) -> f64 {
+    if sample_indices.is_empty() {
+        return 0.0;
+    }
+    let mut matches = 0usize;
+    for &idx in sample_indices {
+        if idx >= a.frames.len() || idx >= b.frames.len() {
+            return 0.0;
+        }
+        if a.frames[idx].perceptual_hash == b.frames[idx].perceptual_hash {
+            matches += 1;
+        }
+    }
+    matches as f64 / sample_indices.len() as f64
+}
+
+/// Disjoint-set union for clustering episodes that match pairwise.
+struct IdentityUnionFind {
+    parent: Vec<usize>,
+}
+
+impl IdentityUnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]);
+        }
+        self.parent[x]
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent[ra] = rb;
+        }
+    }
+}
+
+/// Cluster `episode_ids` (all the same frame count) into connected components where an edge
+/// exists when pairwise sample match ratio is high enough. This finds *all* duplicate groups
+/// in the bucket (not only those matching the first file).
+fn cluster_full_video_duplicates(
+    episode_ids: &[usize],
+    episode_frames: &[EpisodeFrames],
+    debug_dupes: bool,
+) -> Vec<Vec<usize>> {
+    let n = episode_ids.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let frame_count = episode_frames[episode_ids[0]].frames.len();
+    let sample_indices = identity_sample_indices(frame_count);
+    if sample_indices.is_empty() {
+        return Vec::new();
+    }
+
+    if debug_dupes {
+        println!(
+            "Full-video identity: {} episodes, {} frames each, {} sample positions",
+            n,
+            frame_count,
+            sample_indices.len()
+        );
+    }
+
+    let mut uf = IdentityUnionFind::new(n);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let ei = episode_ids[i];
+            let ej = episode_ids[j];
+            let ratio = pairwise_identity_match_ratio(
+                &episode_frames[ei],
+                &episode_frames[ej],
+                &sample_indices,
+            );
+            if ratio >= FULL_VIDEO_IDENTITY_MIN_RATIO {
+                uf.union(i, j);
+            } else if debug_dupes {
+                println!(
+                    "  Episodes {} vs {}: sample match {:.1}% (not linked)",
+                    ei,
+                    ej,
+                    ratio * 100.0
+                );
+            }
+        }
+    }
+
+    let mut buckets: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = uf.find(i);
+        buckets.entry(root).or_default().push(episode_ids[i]);
+    }
+
+    let mut clusters: Vec<Vec<usize>> = buckets.into_values().collect();
+    for c in &mut clusters {
+        c.sort_unstable();
+    }
+    clusters.sort_by(|a, b| a[0].cmp(&b[0]));
+    clusters
+}
+
+fn common_segment_for_full_video_cluster(
+    cluster: &[usize],
+    episode_frames: &[EpisodeFrames],
+    config: &crate::Config,
+    debug_dupes: bool,
+) -> Option<CommonSegment> {
+    if cluster.len() < config.threshold {
+        return None;
+    }
+
+    let first_id = cluster[0];
+    let first_episode = &episode_frames[first_id];
+    if first_episode.frames.is_empty() {
+        return None;
+    }
+
+    let first_frame_time = first_episode.frames[0].timestamp;
+    let last_frame_time = first_episode.frames.last().unwrap().timestamp;
+    let duration = last_frame_time - first_frame_time;
+    if duration < config.min_duration {
+        return None;
+    }
+
+    let mut episode_names: Vec<String> = cluster
+        .iter()
+        .map(|&id| {
+            episode_frames[id]
+                .episode_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .collect();
+    episode_names.sort();
+
+    let segment = CommonSegment {
+        start_time: first_frame_time,
+        end_time: last_frame_time,
+        episode_list: episode_names,
+        episode_timings: None,
+        confidence: 1.0,
+        video_confidence: Some(1.0),
+        audio_confidence: None,
+        match_type: MatchType::Video,
+    };
+
+    if debug_dupes {
+        println!(
+            "Found full video duplicate: {:.1}s - {:.1}s (duration: {:.1}s)",
+            segment.start_time, segment.end_time, duration
+        );
+        println!("  Episodes: {}", segment.episode_list.join(", "));
+    }
+
+    Some(segment)
+}
+
 /// Detect fully identical videos by comparing frame counts and key frame hashes
 fn detect_full_video_duplicates(
     episode_frames: &[EpisodeFrames],
@@ -864,146 +1350,44 @@ fn detect_full_video_duplicates(
             .push(episode_id);
     }
 
-    // Find groups with enough episodes
+    let mut all_segments = Vec::new();
+
     for (frame_count, episode_ids) in frame_count_groups {
-        if episode_ids.len() >= config.threshold {
-            // Check if these episodes are fully identical
-            if let Some(identical_segments) =
-                check_episodes_identical(&episode_ids, episode_frames, config, debug_dupes)?
+        if episode_ids.len() < config.threshold {
+            continue;
+        }
+
+        if debug_dupes {
+            println!("\n=== DEBUG: Full Video Detection ===");
+            println!(
+                "Bucket: {} episodes with {} frames each",
+                episode_ids.len(),
+                frame_count
+            );
+        }
+
+        let clusters = cluster_full_video_duplicates(&episode_ids, episode_frames, debug_dupes);
+        for cluster in clusters {
+            if let Some(seg) =
+                common_segment_for_full_video_cluster(&cluster, episode_frames, config, debug_dupes)
             {
-                if debug_dupes {
-                    println!("\n=== DEBUG: Full Video Detection ===");
-                    println!(
-                        "Found {} fully identical episodes with {} frames each",
-                        episode_ids.len(),
-                        frame_count
-                    );
-                }
-                return Ok(Some(identical_segments));
+                all_segments.push(seg);
             }
         }
     }
 
-    Ok(None)
-}
-
-/// Check if a group of episodes are fully identical
-fn check_episodes_identical(
-    episode_ids: &[usize],
-    episode_frames: &[EpisodeFrames],
-    config: &crate::Config,
-    debug_dupes: bool,
-) -> Result<Option<Vec<CommonSegment>>> {
-    if episode_ids.len() < config.threshold {
+    if all_segments.is_empty() {
         return Ok(None);
     }
 
-    let first_episode_id = episode_ids[0];
-    let first_episode = &episode_frames[first_episode_id];
-    let frame_count = first_episode.frames.len();
+    all_segments.sort_by(|a, b| {
+        a.start_time
+            .partial_cmp(&b.start_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.episode_list.len().cmp(&b.episode_list.len()))
+    });
 
-    // Sample key frames: first 10, middle 10, last 10
-    let sample_indices = if frame_count <= 30 {
-        (0..frame_count).collect::<Vec<_>>()
-    } else {
-        let mut indices = Vec::new();
-        // First 10 frames
-        indices.extend(0..10.min(frame_count));
-        // Middle 10 frames
-        let middle_start = frame_count / 2 - 5;
-        indices.extend(middle_start..(middle_start + 10).min(frame_count));
-        // Last 10 frames
-        let last_start = frame_count.saturating_sub(10);
-        indices.extend(last_start..frame_count);
-        indices.sort();
-        indices.dedup();
-        indices
-    };
-
-    if debug_dupes {
-        println!(
-            "Checking {} episodes for full identity using {} sample frames",
-            episode_ids.len(),
-            sample_indices.len()
-        );
-    }
-
-    // Compare sample frames across all episodes
-    let mut identical_episodes = vec![first_episode_id];
-
-    for &episode_id in &episode_ids[1..] {
-        let episode = &episode_frames[episode_id];
-        let mut matches = 0;
-
-        for &frame_idx in &sample_indices {
-            if frame_idx >= episode.frames.len() {
-                break;
-            }
-
-            let first_hash = first_episode.frames[frame_idx].perceptual_hash;
-            let current_hash = episode.frames[frame_idx].perceptual_hash;
-
-            if first_hash == current_hash {
-                matches += 1;
-            }
-        }
-
-        let match_ratio = matches as f64 / sample_indices.len() as f64;
-        if match_ratio >= 0.95 {
-            // 95% match threshold for full video identity
-            identical_episodes.push(episode_id);
-        } else if debug_dupes {
-            println!(
-                "Episode {} only matches {:.1}% of sample frames",
-                episode_id,
-                match_ratio * 100.0
-            );
-        }
-    }
-
-    if identical_episodes.len() >= config.threshold {
-        // Create segment for full video duration
-        let episode_names: Vec<String> = identical_episodes
-            .iter()
-            .map(|&id| {
-                episode_frames[id]
-                    .episode_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            })
-            .collect();
-
-        let first_frame_time = first_episode.frames[0].timestamp;
-        let last_frame_time = first_episode.frames.last().unwrap().timestamp;
-        let duration = last_frame_time - first_frame_time;
-
-        if duration >= config.min_duration {
-            let segment = CommonSegment {
-                start_time: first_frame_time,
-                end_time: last_frame_time,
-                episode_list: episode_names,
-                episode_timings: None,
-                confidence: 1.0, // Full identity = 100% confidence
-                video_confidence: Some(1.0),
-                audio_confidence: None,
-                match_type: MatchType::Video,
-            };
-
-            if debug_dupes {
-                println!(
-                    "Found full video duplicate: {:.1}s - {:.1}s (duration: {:.1}s)",
-                    segment.start_time, segment.end_time, duration
-                );
-                println!("  Episodes: {}", segment.episode_list.join(", "));
-            }
-
-            return Ok(Some(vec![segment]));
-        }
-    }
-
-    Ok(None)
+    Ok(Some(all_segments))
 }
 
 /// Detect using multi-scale perceptual hashing
@@ -1011,24 +1395,30 @@ fn detect_with_multi_hash(
     episode_frames: &[EpisodeFrames],
     config: &crate::Config,
     debug_dupes: bool,
+    progress: &mut ScopedDuplicateProgress<'_, '_>,
 ) -> Result<Vec<CommonSegment>> {
+    progress.report(0.0);
     // First, check for fully identical videos
     if let Some(full_duplicate_segments) =
         detect_full_video_duplicates(episode_frames, config, debug_dupes)?
     {
+        progress.report(1.0);
         return Ok(full_duplicate_segments);
     }
 
     // Check for identical opening segments
     if let Some(opening_segments) = detect_opening_segments(episode_frames, config, debug_dupes)? {
+        progress.report(1.0);
         return Ok(opening_segments);
     }
 
     let mut multi_hashes = Vec::new();
     let window_size = (config.min_duration as usize).max(10);
 
+    let ep_total = episode_frames.len().max(1);
     // Generate multi-scale hashes for each episode
     for (episode_id, episode) in episode_frames.iter().enumerate() {
+        progress.report_span(0.0, 0.35, episode_id as f64 / ep_total as f64);
         let mut rolling_hash = RollingHash::new(window_size);
 
         for (i, frame) in episode.frames.iter().enumerate() {
@@ -1083,7 +1473,13 @@ fn detect_with_multi_hash(
     // Group by similarity using multi-scale hashing
     let mut hash_groups: HashMap<u64, Vec<(MultiScaleHash, usize, f64, f64)>> = HashMap::new();
 
-    for (multi_hash, episode_id, start_time, end_time) in multi_hashes {
+    let mh_total = multi_hashes.len().max(1);
+    for (mh_idx, (multi_hash, episode_id, start_time, end_time)) in
+        multi_hashes.into_iter().enumerate()
+    {
+        if mh_idx % 256 == 0 || mh_idx + 1 == mh_total {
+            progress.report_span(0.35, 0.72, mh_idx as f64 / mh_total as f64);
+        }
         // Try to find an existing group with similar hash
         let mut target_group_hash = None;
 
@@ -1125,7 +1521,11 @@ fn detect_with_multi_hash(
     // Find sequences that appear in enough episodes
     let mut common_segments = Vec::new();
 
-    for (_hash, sequences) in hash_groups {
+    let mg_total = hash_groups.len().max(1);
+    for (mg_idx, (_hash, sequences)) in hash_groups.into_iter().enumerate() {
+        if mg_idx % 32 == 0 || mg_idx + 1 == mg_total {
+            progress.report_span(0.72, 0.95, mg_idx as f64 / mg_total as f64);
+        }
         if sequences.len() >= config.threshold {
             // Group by episode to avoid duplicates
             let mut episode_segments: HashMap<usize, Vec<&(MultiScaleHash, usize, f64, f64)>> =
@@ -1234,6 +1634,7 @@ fn detect_with_multi_hash(
     let mut final_segments = merged_segments;
     final_segments.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
+    progress.report(1.0);
     Ok(final_segments)
 }
 
@@ -1242,16 +1643,20 @@ fn detect_with_ssim_features(
     episode_frames: &[EpisodeFrames],
     config: &crate::Config,
     debug_dupes: bool,
+    progress: &mut ScopedDuplicateProgress<'_, '_>,
 ) -> Result<Vec<CommonSegment>> {
+    progress.report(0.0);
     // First, check for fully identical videos
     if let Some(full_duplicate_segments) =
         detect_full_video_duplicates(episode_frames, config, debug_dupes)?
     {
+        progress.report(1.0);
         return Ok(full_duplicate_segments);
     }
 
     // Check for identical opening segments
     if let Some(opening_segments) = detect_opening_segments(episode_frames, config, debug_dupes)? {
+        progress.report(1.0);
         return Ok(opening_segments);
     }
 
@@ -1260,8 +1665,10 @@ fn detect_with_ssim_features(
     let mut frame_features = Vec::new();
     let window_size = (config.min_duration as usize).max(10);
 
+    let ep_total = episode_frames.len().max(1);
     // Extract features for each episode
-    for (_episode_id, episode) in episode_frames.iter().enumerate() {
+    for (episode_id, episode) in episode_frames.iter().enumerate() {
+        progress.report_span(0.0, 0.22, episode_id as f64 / ep_total as f64);
         let mut episode_features = Vec::new();
 
         for frame in &episode.frames {
@@ -1325,6 +1732,8 @@ fn detect_with_ssim_features(
     // Create a map to store segments by their content signature
     let mut segment_groups: HashMap<String, Vec<(usize, f64, f64, f64)>> = HashMap::new();
 
+    let mut ssim_cmp_steps: u64 = 0;
+
     // Compare each episode with every other episode
     for i in 0..episode_frames.len() {
         for j in i + 1..episode_frames.len() {
@@ -1349,6 +1758,14 @@ fn detect_with_ssim_features(
                 for start2_idx in
                     (0..features2.len().saturating_sub(window_size_frames)).step_by(step_size)
                 {
+                    ssim_cmp_steps += 1;
+                    if ssim_cmp_steps % 2048 == 0 {
+                        progress.report_span(
+                            0.22,
+                            0.90,
+                            (ssim_cmp_steps as f64 / 400_000.0).min(1.0),
+                        );
+                    }
                     let end2_idx = (start2_idx + window_size_frames).min(features2.len());
                     if end2_idx - start2_idx < window_size_frames {
                         continue;
@@ -1404,8 +1821,13 @@ fn detect_with_ssim_features(
         }
     }
 
+    progress.report_span(0.90, 0.98, 0.5);
     // Process segment groups to find segments that appear in enough episodes
-    for (_signature, episodes) in segment_groups {
+    let sg_total = segment_groups.len().max(1);
+    for (sg_idx, (_signature, episodes)) in segment_groups.into_iter().enumerate() {
+        if sg_idx % 16 == 0 || sg_idx + 1 == sg_total {
+            progress.report_span(0.90, 0.98, sg_idx as f64 / sg_total as f64);
+        }
         let episode_count = episodes.len();
         if episode_count >= config.threshold {
             // Group by episode to avoid duplicates
@@ -1501,6 +1923,7 @@ fn detect_with_ssim_features(
     let mut final_segments = filtered_segments;
     final_segments.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
+    progress.report(1.0);
     Ok(final_segments)
 }
 
@@ -1558,13 +1981,14 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
         // For time-shifted segments (with episode_timings), be more strict to avoid false merges
         let time_gap = segment.start_time - current.end_time;
         let overlap = current.end_time > segment.start_time;
-        
+
         // If both have episode_timings (time-shifted detection), only merge if truly contiguous
-        let merge_threshold = if current.episode_timings.is_some() && segment.episode_timings.is_some() {
-            0.5  // Must be within 0.5s for time-shifted segments
-        } else {
-            2.0  // Normal 2s tolerance for regular segments
-        };
+        let merge_threshold =
+            if current.episode_timings.is_some() && segment.episode_timings.is_some() {
+                0.5 // Must be within 0.5s for time-shifted segments
+            } else {
+                2.0 // Normal 2s tolerance for regular segments
+            };
 
         if overlap || time_gap <= merge_threshold {
             // Merge segments
@@ -1591,20 +2015,12 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
 
             // Merge confidence values (use max for each)
             if let Some(v_conf) = segment.video_confidence {
-                current.video_confidence = Some(
-                    current
-                        .video_confidence
-                        .unwrap_or(0.0)
-                        .max(v_conf)
-                );
+                current.video_confidence =
+                    Some(current.video_confidence.unwrap_or(0.0).max(v_conf));
             }
             if let Some(a_conf) = segment.audio_confidence {
-                current.audio_confidence = Some(
-                    current
-                        .audio_confidence
-                        .unwrap_or(0.0)
-                        .max(a_conf)
-                );
+                current.audio_confidence =
+                    Some(current.audio_confidence.unwrap_or(0.0).max(a_conf));
             }
 
             // Merge episode_timings - prevent duplicates and disjoint ranges
@@ -1612,16 +2028,21 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
                 if let Some(ref mut curr_timings) = current.episode_timings {
                     // Merge timing information for each episode
                     for seg_timing in seg_timings {
-                        if let Some(curr_timing) = curr_timings.iter_mut()
-                            .find(|t| t.episode_name == seg_timing.episode_name) {
+                        if let Some(curr_timing) = curr_timings
+                            .iter_mut()
+                            .find(|t| t.episode_name == seg_timing.episode_name)
+                        {
                             // Only expand if ranges overlap or are contiguous (within 5s)
                             // This prevents merging disjoint segments (intro + outro)
-                            let ranges_overlap = seg_timing.start_time <= curr_timing.end_time + 5.0
+                            let ranges_overlap = seg_timing.start_time
+                                <= curr_timing.end_time + 5.0
                                 && seg_timing.end_time >= curr_timing.start_time - 5.0;
-                            
+
                             if ranges_overlap {
-                                curr_timing.start_time = curr_timing.start_time.min(seg_timing.start_time);
-                                curr_timing.end_time = curr_timing.end_time.max(seg_timing.end_time);
+                                curr_timing.start_time =
+                                    curr_timing.start_time.min(seg_timing.start_time);
+                                curr_timing.end_time =
+                                    curr_timing.end_time.max(seg_timing.end_time);
                             }
                             // If disjoint, DON'T expand - they should be separate segments
                         } else {
@@ -1633,13 +2054,16 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
                     // Current has no timings, use segment's timings
                     current.episode_timings = Some(seg_timings.clone());
                 }
-                
+
                 // Deduplicate episode_timings - if same episode appears multiple times, keep only the largest range
                 if let Some(ref mut timings) = current.episode_timings {
                     let mut deduped: Vec<EpisodeSegmentTiming> = Vec::new();
-                    
+
                     for timing in timings.iter() {
-                        if let Some(existing) = deduped.iter_mut().find(|t| t.episode_name == timing.episode_name) {
+                        if let Some(existing) = deduped
+                            .iter_mut()
+                            .find(|t| t.episode_name == timing.episode_name)
+                        {
                             // Episode already exists, expand to cover both ranges
                             existing.start_time = existing.start_time.min(timing.start_time);
                             existing.end_time = existing.end_time.max(timing.end_time);
@@ -1647,18 +2071,24 @@ pub fn merge_overlapping_segments(mut segments: Vec<CommonSegment>) -> Vec<Commo
                             deduped.push(timing.clone());
                         }
                     }
-                    
+
                     current.episode_timings = Some(deduped);
                 }
-                
+
                 // Rebuild episode_list from episode_timings to ensure consistency
-                current.episode_list = current.episode_timings.as_ref().unwrap()
+                current.episode_list = current
+                    .episode_timings
+                    .as_ref()
+                    .unwrap()
                     .iter()
                     .map(|t| t.episode_name.clone())
                     .collect();
             } else if segment.episode_timings.is_none() && current.episode_timings.is_some() {
                 // Current has timings but segment doesn't - rebuild current's episode_list from timings
-                current.episode_list = current.episode_timings.as_ref().unwrap()
+                current.episode_list = current
+                    .episode_timings
+                    .as_ref()
+                    .unwrap()
                     .iter()
                     .map(|t| t.episode_name.clone())
                     .collect();
@@ -1789,14 +2219,12 @@ pub fn merge_overlapping_segments_legacy(mut segments: Vec<CommonSegment>) -> Ve
 
             // Merge confidence values (average for legacy function)
             if let Some(v_conf) = segment.video_confidence {
-                current.video_confidence = Some(
-                    (current.video_confidence.unwrap_or(0.0) + v_conf) / 2.0
-                );
+                current.video_confidence =
+                    Some((current.video_confidence.unwrap_or(0.0) + v_conf) / 2.0);
             }
             if let Some(a_conf) = segment.audio_confidence {
-                current.audio_confidence = Some(
-                    (current.audio_confidence.unwrap_or(0.0) + a_conf) / 2.0
-                );
+                current.audio_confidence =
+                    Some((current.audio_confidence.unwrap_or(0.0) + a_conf) / 2.0);
             }
 
             // Merge match types
@@ -1841,9 +2269,16 @@ pub fn detect_audio_segments(
     }
 
     if debug_dupes {
-        println!("🎵 Detecting audio segments across {} episodes", episode_audio.len());
+        println!(
+            "🎵 Detecting audio segments across {} episodes",
+            episode_audio.len()
+        );
         for (i, ep) in episode_audio.iter().enumerate() {
-            println!("  Episode {}: {} audio frames", i + 1, ep.audio_frames.len());
+            println!(
+                "  Episode {}: {} audio frames",
+                i + 1,
+                ep.audio_frames.len()
+            );
         }
     }
 
@@ -1875,13 +2310,19 @@ pub fn detect_audio_segments(
     }
 
     if debug_dupes {
-        println!("  Generated {} audio sequence hashes", sequence_hashes.len());
+        println!(
+            "  Generated {} audio sequence hashes",
+            sequence_hashes.len()
+        );
     }
 
     // Group sequences by hash
     let mut hash_groups: HashMap<u64, Vec<SequenceHash>> = HashMap::new();
     for seq in sequence_hashes {
-        hash_groups.entry(seq.hash).or_insert_with(Vec::new).push(seq);
+        hash_groups
+            .entry(seq.hash)
+            .or_insert_with(Vec::new)
+            .push(seq);
     }
 
     if debug_dupes {
@@ -1890,7 +2331,11 @@ pub fn detect_audio_segments(
             .iter()
             .filter(|(_, v)| v.len() >= config.threshold)
             .collect();
-        println!("  Hash groups meeting threshold ({}): {}", config.threshold, large_groups.len());
+        println!(
+            "  Hash groups meeting threshold ({}): {}",
+            config.threshold,
+            large_groups.len()
+        );
     }
 
     let mut common_segments = Vec::new();
@@ -1906,7 +2351,10 @@ pub fn detect_audio_segments(
                     .push(seq);
             }
 
-            if debug_dupes && sequences.len() >= config.threshold && episode_segments.len() < config.threshold {
+            if debug_dupes
+                && sequences.len() >= config.threshold
+                && episode_segments.len() < config.threshold
+            {
                 println!(
                     "  Skipping hash group: {} sequences from only {} episodes (need {})",
                     sequences.len(),
@@ -2099,7 +2547,7 @@ mod tests {
     fn test_detect_common_segments_empty() {
         let episodes = vec![];
         let config = crate::Config::default();
-        let result = detect_common_segments(&episodes, &config, false);
+        let result = detect_common_segments(&episodes, &config, false, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
@@ -2128,7 +2576,7 @@ mod tests {
         )];
 
         let config = crate::Config::default();
-        let result = detect_common_segments(&episodes, &config, false);
+        let result = detect_common_segments(&episodes, &config, false, None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty()); // Not enough episodes
     }
@@ -2160,11 +2608,56 @@ mod tests {
             min_duration: 5.0, // Lower min duration for test
             ..crate::Config::default()
         };
-        let result = detect_common_segments(&episodes, &config, false);
+        let result = detect_common_segments(&episodes, &config, false, None);
         assert!(result.is_ok());
         let segments = result.unwrap();
         assert!(!segments.is_empty());
         assert_eq!(segments[0].episode_list.len(), 3);
+    }
+
+    /// Two separate duplicate pairs sharing the same frame count must both be reported (MEMA-8).
+    #[test]
+    fn test_full_video_duplicate_two_clusters_same_frame_count() {
+        let seq_dup_a = vec![
+            (10.0, 100),
+            (11.0, 101),
+            (12.0, 102),
+            (13.0, 103),
+            (14.0, 104),
+            (15.0, 105),
+            (16.0, 106),
+            (17.0, 107),
+            (18.0, 108),
+            (19.0, 109),
+            (20.0, 110),
+            (21.0, 111),
+            (22.0, 112),
+            (23.0, 113),
+            (24.0, 114),
+        ];
+        let seq_dup_b: Vec<(f64, u64)> = seq_dup_a.iter().map(|(t, h)| (*t, h + 10_000)).collect();
+
+        let episodes = vec![
+            create_test_episode("dup_a1.mkv", seq_dup_a.clone()),
+            create_test_episode("dup_a2.mkv", seq_dup_a),
+            create_test_episode("dup_b1.mkv", seq_dup_b.clone()),
+            create_test_episode("dup_b2.mkv", seq_dup_b),
+        ];
+
+        let config = crate::Config {
+            threshold: 2,
+            min_duration: 5.0,
+            ..crate::Config::default()
+        };
+        let segments = detect_common_segments(&episodes, &config, false, None).expect("detection");
+        assert_eq!(
+            segments.len(),
+            2,
+            "expected two separate full-duplicate groups"
+        );
+        let mut sizes: Vec<usize> = segments.iter().map(|s| s.episode_list.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![2, 2]);
     }
 
     #[test]

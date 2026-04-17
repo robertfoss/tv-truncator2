@@ -1,0 +1,17 @@
+{
+  "test_name": "full_duplicates",
+  "description": "Three identical 30-second files",
+  "files": [
+  "video1.mkv",
+  "video2.mkv",
+  "video3.mkv"
+],
+  "expected_segments": [
+  {
+    "segment_id": "full_video",
+    "start_time": 0.0,
+    "end_time": 30.0,
+    "files": ["video1.mkv", "video2.mkv", "video3.mkv"]
+  }
+]
+}

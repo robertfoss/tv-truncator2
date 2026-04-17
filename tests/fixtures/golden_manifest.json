@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "description": "Critical-path golden fixtures for TVT (MEMA-24). JSON stays in-repo; large *.mkv files are gitignored and optional for CI.",
+  "paths": [
+    {
+      "id": "detection_synthetic",
+      "role": "Segment expectations for synthetic multi-file scenarios (detection / similarity).",
+      "roots": ["tests/samples/synthetic"]
+    },
+    {
+      "id": "long_form_cutting",
+      "role": "Real-episode-style timing notes (optional media).",
+      "roots": ["tests/samples/synthetic/downscaled_2file"]
+    }
+  ],
+  "in_repo_checks": [
+    "Every segments.json under the roots above must be valid JSON with test_name, files, and expected_segments.",
+    "Fast CI: parse + schema validation only. Full tier: tests marked #[ignore] that need local .mkv files.",
+    "MEMA-15: every tests/samples/**/segments.json must fall under a manifest root; see tests/sample_fixture_coverage.rs."
+  ]
+}

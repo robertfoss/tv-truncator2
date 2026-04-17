@@ -1,11 +1,13 @@
-//! Ultra-optimized GStreamer-based frame extraction (V2)
+//! GStreamer-based frame extraction (V2)
 //!
-//! This module implements a highly optimized frame extractor using:
-//! - Seek-based extraction (jump to specific timestamps)
-//! - No downscaling (preserve original video resolution)
-//! - Multi-threaded video conversion
-//! - Optimized GStreamer pipeline configuration
-//! - Full CPU core utilization
+//! Temporal sampling uses `videorate` at the requested **frames per second** (`sample_rate`)
+//! while preserving resolution (no `videoscale`). PTS on each buffer is used as the frame
+//! timestamp for [`crate::analyzer::Frame`].
+//!
+//! Hardware decode is preferred when available (`decodebin` + boosted plugin ranks). If a
+//! hardware-style pipeline error occurs, ranks are restored and extraction retries once with
+//! software decoders. Metadata and duration come from `Discoverer`, matching
+//! [`crate::analyzer::get_video_info`] / [`get_video_duration_gstreamer`].
 
 use crate::analyzer::{generate_perceptual_hash, Frame};
 use crate::Config;
@@ -16,49 +18,233 @@ use gstreamer_app as gst_app;
 use gstreamer_pbutils as gst_pbutils;
 use image::RgbImage;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Optional hardware decoders we may rank-boost, with short install hints for the CLI.
+pub const OPTIONAL_HW_VIDEO_DECODERS: &[(&str, &str)] = &[
+    (
+        "vaapih264dec",
+        "VA-API H.264 — install GStreamer VA-API elements (often gst-plugins-bad) and GPU drivers",
+    ),
+    (
+        "vaapih265dec",
+        "VA-API HEVC — same stack as VA-API H.264 where supported",
+    ),
+    (
+        "vaapimpeg2dec",
+        "VA-API MPEG-2 — same stack as VA-API H.264 where supported",
+    ),
+    (
+        "nvh264dec",
+        "NVDEC H.264 — NVIDIA proprietary stack / gst-plugins-bad on Linux",
+    ),
+    (
+        "nvh265dec",
+        "NVDEC HEVC — NVIDIA proprietary stack where supported",
+    ),
+    (
+        "d3d11h264dec",
+        "D3D11 H.264 — Windows GPU decode via GStreamer d3d11 plugin set",
+    ),
+    (
+        "d3d11h265dec",
+        "D3D11 HEVC — Windows GPU decode where supported",
+    ),
+];
+
+/// When true (default), [`boost_hardware_decoder_ranks`] runs on first [`init_gstreamer`].
+/// Set via [`set_prefer_hardware_video_decode`] before any GStreamer call to disable rank boosts
+/// (e.g. `--no-hardware-video-decode` on the CLI).
+static PREFER_HW_VIDEO_DECODE: AtomicBool = AtomicBool::new(true);
+
+/// After a runtime decode failure we treat as hardware-related, ranks are restored and this is set
+/// so we never boost again in this process (graceful software fallback for all subsequent files).
+static HW_DECODE_RANK_BOOST_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Original ranks captured before the first boost (used for rollback).
+static HW_ORIGINAL_RANKS: Mutex<Option<Vec<(String, gst::Rank)>>> = Mutex::new(None);
+
+/// Prefer hardware video decoders when plugins are available (default: `true`).
+pub fn set_prefer_hardware_video_decode(prefer: bool) {
+    PREFER_HW_VIDEO_DECODE.store(prefer, Ordering::Relaxed);
+}
+
+/// Current preference for boosting hardware decoder plugin ranks.
+pub fn prefer_hardware_video_decode_enabled() -> bool {
+    PREFER_HW_VIDEO_DECODE.load(Ordering::Relaxed)
+}
+
+/// True if a missing `candidate_factory` should be listed in CLI hints when
+/// `first_present` is the first installed optional HW decoder (same vendor stack only).
+fn missing_hw_decoder_hint_in_scope(first_present: Option<&str>, candidate_factory: &str) -> bool {
+    let Some(present) = first_present else {
+        return true;
+    };
+    let prefix = if present.starts_with("vaapi") {
+        "vaapi"
+    } else if present.starts_with("nvh") {
+        "nvh"
+    } else if present.starts_with("d3d11") {
+        "d3d11"
+    } else {
+        return true;
+    };
+    candidate_factory.starts_with(prefix)
+}
+
+/// One-line hints per **missing** optional hardware decoder plugin (for CLI / UX).
+///
+/// If at least one optional hardware decoder is already installed, only missing plugins
+/// from that **same stack** (VA-API, NVDEC, or D3D11) are listed so we do not spam
+/// irrelevant vendor plugins. If none are installed, every missing entry is listed.
+pub fn missing_optional_hw_decoder_install_hints() -> Vec<String> {
+    let _ = init_gstreamer();
+    let registry = gst::Registry::get();
+
+    let mut first_present: Option<&str> = None;
+    for (name, _) in OPTIONAL_HW_VIDEO_DECODERS {
+        if let Some(f) = registry.find_feature(name, gst::ElementFactory::static_type()) {
+            if f.rank() != gst::Rank::NONE {
+                first_present = Some(*name);
+                break;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (factory, tip) in OPTIONAL_HW_VIDEO_DECODERS {
+        let missing = registry
+            .find_feature(factory, gst::ElementFactory::static_type())
+            .map(|f| f.rank() == gst::Rank::NONE)
+            .unwrap_or(true);
+        if !missing {
+            continue;
+        }
+        if !missing_hw_decoder_hint_in_scope(first_present, factory) {
+            continue;
+        }
+        out.push(format!("`{}` not found — {}", factory, tip));
+    }
+    out
+}
 
 /// Initialize GStreamer (call once at startup)
 pub fn init_gstreamer() -> Result<()> {
     gst::init()?;
+    boost_hardware_decoder_ranks();
     Ok(())
+}
+
+/// Raise ranks of hardware video decoders so [`create_optimized_pipeline_v2`]'s `decodebin`
+/// autoplugs them ahead of typical software `PRIMARY` decoders (process-wide, idempotent).
+fn boost_hardware_decoder_ranks() {
+    if !PREFER_HW_VIDEO_DECODE.load(Ordering::Relaxed) {
+        return;
+    }
+    if HW_DECODE_RANK_BOOST_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let registry = gst::Registry::get();
+    // Typical sw decoders are PRIMARY (256); nudge known HW elements above that when present.
+    let preferred = gst::Rank::PRIMARY + 100;
+    let mut snap = HW_ORIGINAL_RANKS.lock().unwrap();
+    if snap.is_none() {
+        let mut originals = Vec::new();
+        for (name, _) in OPTIONAL_HW_VIDEO_DECODERS {
+            if let Some(f) = registry.find_feature(name, gst::ElementFactory::static_type()) {
+                if f.rank() != gst::Rank::NONE {
+                    originals.push(((*name).to_string(), f.rank()));
+                    f.set_rank(preferred);
+                }
+            }
+        }
+        *snap = Some(originals);
+    } else {
+        for (name, _) in OPTIONAL_HW_VIDEO_DECODERS {
+            if let Some(f) = registry.find_feature(name, gst::ElementFactory::static_type()) {
+                if f.rank() != gst::Rank::NONE {
+                    f.set_rank(preferred);
+                }
+            }
+        }
+    }
+}
+
+/// Restore decoder plugin ranks after a hardware decode failure and stop boosting for this process.
+fn rollback_hw_decoder_rank_boost_for_software_fallback() {
+    let registry = gst::Registry::get();
+    let mut snap = HW_ORIGINAL_RANKS.lock().unwrap();
+    if let Some(originals) = snap.take() {
+        for (name, rank) in originals {
+            if let Some(f) = registry.find_feature(&name, gst::ElementFactory::static_type()) {
+                f.set_rank(rank);
+            }
+        }
+    }
+    HW_DECODE_RANK_BOOST_DISABLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn is_likely_hardware_decode_failure(err: &anyhow::Error) -> bool {
+    let mut chain = err.to_string().to_lowercase();
+    for cause in err.chain().skip(1) {
+        chain.push(' ');
+        chain.push_str(&cause.to_string().to_lowercase());
+    }
+    const NEEDLES: &[&str] = &[
+        "vaapi",
+        "vadisplay",
+        "nvdec",
+        "nvh26",
+        "d3d11",
+        " egl",
+        "drm",
+        "cuda",
+        "vdpau",
+        "mmal",
+        "qsv",
+        "videotoolbox",
+        "failed to open drm",
+        "cannot allocate memory",
+        "internal data stream error",
+    ];
+    NEEDLES.iter().any(|n| chain.contains(n))
 }
 
 /// Check if hardware video acceleration is available
 pub fn check_hardware_acceleration() -> (bool, String) {
     // Initialize GStreamer if not already done
     let _ = init_gstreamer();
-    
-    // Check for VA-API decoder availability
+
     let registry = gst::Registry::get();
-    
-    // Check for common hardware decoders
-    let hw_decoders = [
-        ("vaapih264dec", "VA-API (Intel/AMD)"),
-        ("vaapih265dec", "VA-API HEVC"),
-        ("nvh264dec", "NVDEC (NVIDIA)"),
-        ("nvh265dec", "NVDEC HEVC"),
-    ];
-    
-    for (decoder_name, description) in &hw_decoders {
-        if let Some(feature) = registry.find_feature(decoder_name, gst::ElementFactory::static_type()) {
+
+    for (decoder_name, _) in OPTIONAL_HW_VIDEO_DECODERS {
+        if let Some(feature) =
+            registry.find_feature(decoder_name, gst::ElementFactory::static_type())
+        {
             if feature.rank() != gst::Rank::NONE {
-                return (true, format!("{}", description));
+                let label = match *decoder_name {
+                    "vaapih264dec" => "VA-API (Intel/AMD)",
+                    "vaapih265dec" => "VA-API HEVC",
+                    "vaapimpeg2dec" => "VA-API MPEG-2",
+                    "nvh264dec" => "NVDEC (NVIDIA)",
+                    "nvh265dec" => "NVDEC HEVC",
+                    "d3d11h264dec" => "D3D11 (Windows)",
+                    "d3d11h265dec" => "D3D11 HEVC (Windows)",
+                    _ => *decoder_name,
+                };
+                return (true, label.to_string());
             }
         }
     }
-    
+
     (false, "Software only".to_string())
 }
 
-/// Extract frames using ultra-optimized seek-based approach
+/// Extract frames at `sample_rate` frames per second (decoded RGB → perceptual hash per buffer).
 ///
-/// This implementation uses seek-based extraction with an optimized pipeline:
-/// - Seeks directly to target timestamps (no sequential processing)
-/// - Preserves original video resolution (no downscaling)
-/// - Uses multi-threaded video conversion
-/// - Maximizes CPU utilization
+/// Resolution is preserved (no scaling). Timestamps come from buffer PTS.
 ///
 /// # Arguments
 /// * `video_path` - Path to the video file
@@ -72,6 +258,40 @@ pub fn extract_frames_gstreamer_v2<F>(
     video_path: &Path,
     sample_rate: f64,
     progress_callback: F,
+    config: &Config,
+) -> Result<Vec<Frame>>
+where
+    F: Fn(usize, usize) + Send + Sync + 'static,
+{
+    let progress = Arc::new(progress_callback);
+    for attempt in 0u8..2 {
+        match extract_frames_gstreamer_v2_impl(video_path, sample_rate, progress.clone(), config) {
+            Ok(frames) => return Ok(frames),
+            Err(e)
+                if attempt == 0
+                    && prefer_hardware_video_decode_enabled()
+                    && !HW_DECODE_RANK_BOOST_DISABLED.load(Ordering::Relaxed)
+                    && is_likely_hardware_decode_failure(&e) =>
+            {
+                if !config.json_summary {
+                    eprintln!(
+                        "Video decode: hardware decode failed; restoring default plugin ranks and retrying with software decoders.\n  ({})",
+                        e
+                    );
+                }
+                rollback_hw_decoder_rank_boost_for_software_fallback();
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("extract_frames_gstreamer_v2 retry loop");
+}
+
+fn extract_frames_gstreamer_v2_impl<F>(
+    video_path: &Path,
+    sample_rate: f64,
+    progress_callback: Arc<F>,
     config: &Config,
 ) -> Result<Vec<Frame>>
 where
@@ -104,16 +324,10 @@ where
         );
     }
 
-    // Calculate target timestamps for frame extraction
-    let frame_timestamps: Vec<f64> = (0..expected_frames)
-        .map(|i| (i as f64) / sample_rate)
-        .filter(|&t| t < duration)
-        .collect();
-
     if config.debug {
         println!(
-            "⚡ Will seek to {} specific timestamps",
-            frame_timestamps.len()
+            "⚡ Target ~{} frames over {:.2}s at {:.3} fps (videorate)",
+            expected_frames, duration, sample_rate
         );
     }
 
@@ -129,7 +343,6 @@ where
     // Set up frame collection
     let frames = Arc::new(Mutex::new(Vec::<Frame>::new()));
     let frames_clone = frames.clone();
-    let progress_callback = Arc::new(progress_callback);
     let progress_callback_clone = progress_callback.clone();
     let expected_frames_clone = expected_frames;
 
@@ -191,12 +404,20 @@ where
                     perceptual_hash: hash,
                 };
 
-                {
+                let current_count = {
                     let mut frames = frames_clone.lock().unwrap();
                     frames.push(frame);
-                    let current_count = frames.len();
+                    frames.len()
+                };
 
-                    // Call progress callback
+                // Never call progress while holding `frames_clone`: the callback may lock shared
+                // processor state and parallel extractors can deadlock. Also throttle updates —
+                // locking the global processor mutex per frame is extremely expensive with many workers.
+                const PROGRESS_STRIDE: usize = 32;
+                let should_report = current_count == 1
+                    || current_count % PROGRESS_STRIDE == 0
+                    || current_count >= expected_frames_clone;
+                if should_report {
                     progress_callback_clone(current_count, expected_frames_clone);
                 }
 
@@ -216,9 +437,23 @@ where
         println!("⚡ Waiting for pipeline to be ready...");
     }
 
-    // Process entire stream for now (will optimize seeking later)
-    // This ensures we get all frames correctly
-    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+    // Run until EOS with a wall-clock bound so a stuck pipeline cannot hang forever
+    let wall_deadline =
+        Instant::now() + std::time::Duration::from_secs_f64((duration * 6.0).max(120.0));
+    let mut eos_seen = false;
+    while !eos_seen {
+        if Instant::now() >= wall_deadline {
+            pipeline.set_state(gst::State::Null)?;
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for end-of-stream from frame extraction pipeline"
+            ));
+        }
+        let remaining = wall_deadline.saturating_duration_since(Instant::now());
+        let chunk_ns = remaining.as_nanos().min(10_000_000_000) as u64;
+        let timeout = gst::ClockTime::from_nseconds(chunk_ns.max(1));
+        let Some(msg) = bus.timed_pop(Some(timeout)) else {
+            continue;
+        };
         use gst::MessageView;
 
         match msg.view() {
@@ -226,13 +461,14 @@ where
                 if config.debug {
                     println!("⚡ Received EOS - extraction complete");
                 }
-                break;
+                eos_seen = true;
             }
             MessageView::Error(err) => {
                 let error_msg = format!("Pipeline error: {}", err.error());
                 if config.debug {
                     println!("⚠️  {}", error_msg);
                 }
+                pipeline.set_state(gst::State::Null)?;
                 return Err(anyhow::anyhow!("{}", error_msg));
             }
             MessageView::StateChanged(state_changed) => {
@@ -279,14 +515,15 @@ where
 /// Pipeline design:
 /// - filesrc: Read video file with large block size
 /// - queue: Buffer to prevent stalls (no size limits for max throughput)
-/// - decodebin: Decode video stream
+/// - decodebin: Decode video stream (HW preferred via boosted plugin ranks at init)
 /// - queue: Buffer decoded frames
+/// - videorate: Temporal downsampling to the requested sample FPS **before** color convert
 /// - videoconvert: Convert to RGB with multi-threading (n-threads=0)
 /// - appsink: Extract frames without sync/throttling
 ///
 /// Key optimizations:
 /// - NO videoscale: Preserve original resolution
-/// - NO videorate: Manual frame selection via seeking
+/// - videorate before videoconvert: avoid colorspace work on frames we will drop
 /// - sync=false: No synchronization overhead
 /// - n-threads=0: Auto-detect and use all CPU threads
 /// - Large queues: Prevent pipeline stalls
@@ -312,7 +549,7 @@ fn create_optimized_pipeline_v2(
     // Create elements with optimized properties
     let filesrc = gst::ElementFactory::make("filesrc")
         .property("location", &absolute_path)
-        .property("blocksize", 65536u32) // 64KB blocks for better I/O
+        .property("blocksize", 256 * 1024u32) // 256KB sequential reads
         .build()?;
 
     // Queue before decoding - no limits for maximum throughput
@@ -326,7 +563,7 @@ fn create_optimized_pipeline_v2(
     // Decodebin will automatically select hardware decoder (VA-API) if available
     // and fall back to software decoder if hardware fails or is unavailable
     let decodebin = gst::ElementFactory::make("decodebin").build()?;
-    
+
     // Set up error recovery for VA-API failures
     // If VA-API fails to allocate buffers, GStreamer will automatically try software decoders
     if config.debug {
@@ -346,7 +583,7 @@ fn create_optimized_pipeline_v2(
         .property("n-threads", 0u32) // Auto-detect threads (use all cores)
         .build()?;
 
-    // Videorate for frame sampling (Note: This is temporary - will be replaced with seeking in future optimization)
+    // Downsample in time to `sample_rate` fps (see module docs)
     let videorate = gst::ElementFactory::make("videorate")
         .name("videorate")
         .build()?;
@@ -473,18 +710,18 @@ fn create_optimized_pipeline_v2(
             }
         };
 
-        if let Err(e) = queue2.link(&videoconvert) {
-            eprintln!("⚠️  Failed to link queue2 to videoconvert: {}", e);
+        if let Err(e) = queue2.link(&videorate) {
+            eprintln!("⚠️  Failed to link queue2 to videorate: {}", e);
             return;
         }
 
-        if let Err(e) = videoconvert.link(&videorate) {
-            eprintln!("⚠️  Failed to link videoconvert to videorate: {}", e);
+        if let Err(e) = videorate.link(&videoconvert) {
+            eprintln!("⚠️  Failed to link videorate to videoconvert: {}", e);
             return;
         }
 
-        if let Err(e) = videorate.link(&appsink) {
-            eprintln!("⚠️  Failed to link videorate to appsink: {}", e);
+        if let Err(e) = videoconvert.link(&appsink) {
+            eprintln!("⚠️  Failed to link videoconvert to appsink: {}", e);
             return;
         }
 
@@ -573,6 +810,7 @@ pub fn get_video_info_gstreamer(video_path: &Path) -> Result<crate::analyzer::Vi
         .first()
         .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
 
+    let br = video_info.bitrate();
     Ok(crate::analyzer::VideoInfo {
         duration: info
             .duration()
@@ -581,24 +819,59 @@ pub fn get_video_info_gstreamer(video_path: &Path) -> Result<crate::analyzer::Vi
         width: video_info.width(),
         height: video_info.height(),
         fps: video_info.framerate().numer() as f64 / video_info.framerate().denom() as f64,
-        bitrate: Some(
-            info.audio_streams()
-                .first()
-                .map(|s| s.bitrate() as u64)
-                .unwrap_or(0),
-        ),
+        bitrate: if br > 0 { Some(br as u64) } else { None },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn test_v2_gstreamer_initialization() {
         let result = init_gstreamer();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hardware_decode_failure_heuristic_matches_vaapi_message() {
+        let e = anyhow::anyhow!("Pipeline error: vaapih264dec failed to open display");
+        assert!(super::is_likely_hardware_decode_failure(&e));
+    }
+
+    #[test]
+    fn hardware_decode_failure_heuristic_rejects_plain_io() {
+        let e = anyhow::anyhow!("No such file or directory");
+        assert!(!super::is_likely_hardware_decode_failure(&e));
+    }
+
+    #[test]
+    fn missing_hw_hint_scope_lists_all_when_no_present_decoder() {
+        assert!(super::missing_hw_decoder_hint_in_scope(None, "nvh264dec"));
+        assert!(super::missing_hw_decoder_hint_in_scope(
+            None,
+            "vaapih265dec"
+        ));
+    }
+
+    #[test]
+    fn missing_hw_hint_scope_filters_other_vendor_stacks() {
+        assert!(super::missing_hw_decoder_hint_in_scope(
+            Some("vaapih264dec"),
+            "vaapih265dec"
+        ));
+        assert!(!super::missing_hw_decoder_hint_in_scope(
+            Some("vaapih264dec"),
+            "nvh264dec"
+        ));
+        assert!(super::missing_hw_decoder_hint_in_scope(
+            Some("nvh264dec"),
+            "nvh265dec"
+        ));
+        assert!(!super::missing_hw_decoder_hint_in_scope(
+            Some("nvh264dec"),
+            "d3d11h264dec"
+        ));
     }
 
     #[test]

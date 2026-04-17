@@ -8,6 +8,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Represents a single audio frame with timestamp and samples
 #[derive(Debug, Clone)]
@@ -35,6 +36,9 @@ pub struct EpisodeAudio {
 /// # Arguments
 /// * `video_path` - Path to the video file
 /// * `sample_rate_hz` - Sample rate for audio extraction (default: 22050 Hz)
+/// * `duration_hint_secs` - When set (finite, > 0), skips a redundant GStreamer discover pass;
+///   callers that already probed the file (for example the CLI pipeline) should pass
+///   [`crate::analyzer::VideoInfo::duration`]. Otherwise duration is discovered again.
 /// * `progress_callback` - Callback for progress updates
 ///
 /// # Returns
@@ -42,6 +46,7 @@ pub struct EpisodeAudio {
 pub fn extract_audio_samples<F>(
     video_path: &Path,
     sample_rate_hz: usize,
+    duration_hint_secs: Option<f64>,
     progress_callback: F,
 ) -> Result<Vec<f32>>
 where
@@ -59,9 +64,16 @@ where
     let progress_callback = Arc::new(progress_callback);
     let progress_callback_clone = progress_callback.clone();
 
-    // Get expected sample count for progress tracking
-    let duration = crate::analyzer::get_video_duration(video_path)?;
+    // Expected sample count for progress (avoid a second discoverer pass when we already probed)
+    let duration = match duration_hint_secs {
+        Some(d) if d.is_finite() && d > 0.0 => d,
+        _ => crate::analyzer::get_video_duration(video_path)?,
+    };
     let expected_samples = (duration * sample_rate_hz as f64) as usize;
+    let progress_total = expected_samples.max(1);
+
+    // Prime UI before decodebin preroll / first buffer (long gap otherwise).
+    progress_callback_clone(0, progress_total);
 
     // Configure appsink callbacks
     let appsink = pipeline
@@ -77,9 +89,7 @@ where
                 let buffer = sample.buffer().ok_or_else(|| gst::FlowError::Error)?;
 
                 // Extract audio samples from buffer
-                let map = buffer
-                    .map_readable()
-                    .map_err(|_| gst::FlowError::Error)?;
+                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let data = map.as_slice();
 
                 // Convert bytes to f32 samples
@@ -90,13 +100,21 @@ where
                     audio_samples.push(sample);
                 }
 
-                // Add to collection
-                let mut samples = samples_clone.lock().unwrap();
-                samples.extend_from_slice(&audio_samples);
-                let current_count = samples.len();
+                let current_count = {
+                    let mut samples = samples_clone.lock().unwrap();
+                    samples.extend_from_slice(&audio_samples);
+                    samples.len()
+                };
 
-                // Call progress callback
-                progress_callback_clone(current_count, expected_samples);
+                // Same as video path: do not hold sample buffer mutex while invoking progress
+                // (may lock shared processor state). Throttle for hot paths.
+                const PROGRESS_STRIDE: usize = 4096;
+                let should_report = current_count <= PROGRESS_STRIDE
+                    || current_count % PROGRESS_STRIDE == 0
+                    || current_count >= progress_total;
+                if should_report {
+                    progress_callback_clone(current_count, progress_total);
+                }
 
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -106,14 +124,30 @@ where
     // Start pipeline
     pipeline.set_state(gst::State::Playing)?;
 
-    // Wait for completion
+    // Wait for EOS with a wall-clock bound (same discoverer duration as progress estimate)
     let bus = pipeline.bus().unwrap();
-    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+    let wall_deadline =
+        Instant::now() + std::time::Duration::from_secs_f64((duration * 6.0).max(120.0));
+    let mut eos_seen = false;
+    while !eos_seen {
+        if Instant::now() >= wall_deadline {
+            pipeline.set_state(gst::State::Null)?;
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for end-of-stream from audio extraction pipeline"
+            ));
+        }
+        let remaining = wall_deadline.saturating_duration_since(Instant::now());
+        let chunk_ns = remaining.as_nanos().min(10_000_000_000) as u64;
+        let timeout = gst::ClockTime::from_nseconds(chunk_ns.max(1));
+        let Some(msg) = bus.timed_pop(Some(timeout)) else {
+            continue;
+        };
         use gst::MessageView;
 
         match msg.view() {
-            MessageView::Eos(..) => break,
+            MessageView::Eos(..) => eos_seen = true,
             MessageView::Error(err) => {
+                pipeline.set_state(gst::State::Null)?;
                 return Err(anyhow::anyhow!("Audio pipeline error: {}", err.error()));
             }
             _ => {}
@@ -265,13 +299,9 @@ fn create_audio_pipeline(video_path: &Path, sample_rate_hz: usize) -> Result<gst
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_audio_pipeline_creation() {
         let result = crate::gstreamer_extractor_v2::init_gstreamer();
         assert!(result.is_ok());
     }
 }
-
-

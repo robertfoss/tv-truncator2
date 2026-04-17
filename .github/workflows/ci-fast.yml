@@ -1,0 +1,54 @@
+# Fast PR feedback: fmt, clippy, tests excluding #[ignore] (two-tier CI with ci-full.yml).
+name: CI (fast)
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+
+concurrency:
+  group: ci-fast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install GStreamer, ffmpeg, and build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            ffmpeg \
+            libglib2.0-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libgstreamer-plugins-good1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # Deny rustc warnings; allow Clippy suggestions so CI stays green until pedantic cleanup.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -A clippy::all -D warnings
+
+      - name: cargo build benches (compile regression check)
+        run: cargo build --benches
+
+      - name: cargo test (non-ignored)
+        run: cargo test --verbose

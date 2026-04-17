@@ -1,0 +1,39 @@
+{
+  "test_name": "audio_overlap_partial",
+  "description": "Ten files: 5 with audio A, 5 with audio B, all with identical video at 30-45s. Only video segment should be detected (threshold=6).",
+  "files": [
+    "video1.mkv",
+    "video2.mkv",
+    "video3.mkv",
+    "video4.mkv",
+    "video5.mkv",
+    "video6.mkv",
+    "video7.mkv",
+    "video8.mkv",
+    "video9.mkv",
+    "video10.mkv"
+  ],
+  "expected_segments": [
+    {
+      "segment_id": "video_middle",
+      "match_type": "video",
+      "start_time": 30.0,
+      "end_time": 45.0,
+      "time_shifted": false,
+      "per_file_timing": "Same timing in all 10 files (30.0s-45.0s)",
+      "files": [
+        "video1.mkv",
+        "video2.mkv",
+        "video3.mkv",
+        "video4.mkv",
+        "video5.mkv",
+        "video6.mkv",
+        "video7.mkv",
+        "video8.mkv",
+        "video9.mkv",
+        "video10.mkv"
+      ],
+      "notes": "Audio differs between files (5 with pattern A, 5 with pattern B), so only video matches across all 10 files"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 //! Algorithm comparison framework
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use super::common::{AlgorithmComparison, CommonSegment, ComparisonMetrics};
@@ -40,9 +40,13 @@ pub fn compare_algorithms(
     }
 
     // Check ssim results that weren't found in multi-hash
+    let multi_keys: HashSet<String> = multi_hash_results
+        .iter()
+        .map(|segment| format!("{:.1}-{:.1}", segment.start_time, segment.end_time))
+        .collect();
     for segment in &ssim_features_results {
         let key = format!("{:.1}-{:.1}", segment.start_time, segment.end_time);
-        if !ssim_map.contains_key(&key) {
+        if !multi_keys.contains(&key) {
             ssim_features_only.push(segment.clone());
         }
     }

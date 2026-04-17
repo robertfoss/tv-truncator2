@@ -256,18 +256,35 @@ fn emit_video_decode_banner(config: &Config) {
     }
 }
 
-/// stderr-only: list optional GStreamer hardware decoder plugins that are absent (board: call out
-/// specific missing elements that could improve performance). Always uses stderr so `--quiet` /
+/// stderr-only: optional missing hardware decoder notice. Default is **one short line** (board UX);
+/// per-plugin names and install tips only with `--verbose`. Always stderr so `--quiet` /
 /// `--json-summary` keep stdout clean.
 fn emit_optional_hw_decoder_hints(config: &Config) {
     if config.audio_only || !tvt::gstreamer_extractor_v2::prefer_hardware_video_decode_enabled() {
         return;
     }
-    let (hw_available, _) = tvt::gstreamer_extractor_v2::check_hardware_acceleration();
-    let hints = tvt::gstreamer_extractor_v2::missing_optional_hw_decoder_install_hints();
-    if hints.is_empty() {
+    if (config.quiet || config.json_summary) && !config.verbose {
         return;
     }
+    let Some(info) = tvt::gstreamer_extractor_v2::missing_optional_hw_decoders_cli() else {
+        return;
+    };
+
+    if !config.verbose {
+        if info.partial_stack {
+            eprintln!(
+                "Video decode: {} optional decoder plugin(s) missing for {} — run with --verbose for GStreamer element names and install tips.",
+                info.count, info.stack_label
+            );
+        } else {
+            eprintln!(
+                "Video decode: optional GPU hardware decoders not found — software decode will be used. Run with --verbose for checked element names."
+            );
+        }
+        return;
+    }
+
+    let (hw_available, _) = tvt::gstreamer_extractor_v2::check_hardware_acceleration();
     if hw_available {
         eprintln!(
             "Video decode: optional plugins from the same GPU stack are still missing (installing them may improve decode speed for matching codecs):"
@@ -277,11 +294,8 @@ fn emit_optional_hw_decoder_hints(config: &Config) {
             "Video decode: optional hardware decoder plugins are missing — software decode in use; installing any of the following may improve performance:"
         );
     }
-    for line in hints.iter().take(6) {
+    for line in &info.detail_lines {
         eprintln!("  {}", line);
-    }
-    if hints.len() > 6 {
-        eprintln!("  … and {} more.", hints.len() - 6);
     }
 }
 

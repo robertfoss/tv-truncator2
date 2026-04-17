@@ -815,10 +815,7 @@ fn find_repeated_segments(
         } else {
             let processors_cb = Arc::clone(processors_arc);
             let mut on_progress = |local: f64| {
-                update_all_finding_repeated_try(
-                    &processors_cb,
-                    0.3 + local.clamp(0.0, 1.0) * 0.5,
-                );
+                update_all_finding_repeated_try(&processors_cb, 0.3 + local.clamp(0.0, 1.0) * 0.5);
             };
             let video_segments = detect_common_segments(
                 &all_frames,

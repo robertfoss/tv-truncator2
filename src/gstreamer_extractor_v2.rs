@@ -94,12 +94,33 @@ fn missing_hw_decoder_hint_in_scope(first_present: Option<&str>, candidate_facto
     candidate_factory.starts_with(prefix)
 }
 
-/// One-line hints per **missing** optional hardware decoder plugin (for CLI / UX).
+/// Per-plugin install hints for optional hardware decoders (stderr `--verbose` only by default).
+#[derive(Debug, Clone)]
+pub struct MissingOptionalHwDecodersCli {
+    /// Number of missing plugins (same as `detail_lines.len()`).
+    pub count: usize,
+    /// Human label for the active vendor stack, or `"GPU"` when none of our optional decoders are installed.
+    pub stack_label: &'static str,
+    /// True when at least one optional hardware decoder from [`OPTIONAL_HW_VIDEO_DECODERS`] is present.
+    pub partial_stack: bool,
+    /// One line per missing plugin: element name + tip (for `tvt --verbose`).
+    pub detail_lines: Vec<String>,
+}
+
+fn stack_label_for_optional_hw(first_present: Option<&str>) -> &'static str {
+    match first_present {
+        Some(p) if p.starts_with("vaapi") => "VA-API",
+        Some(p) if p.starts_with("nvh") => "NVDEC",
+        Some(p) if p.starts_with("d3d11") => "D3D11",
+        Some(_) => "GPU",
+        None => "GPU",
+    }
+}
+
+/// Collects missing optional hardware decoder plugins (vendor-scoped when part of a stack is installed).
 ///
-/// If at least one optional hardware decoder is already installed, only missing plugins
-/// from that **same stack** (VA-API, NVDEC, or D3D11) are listed so we do not spam
-/// irrelevant vendor plugins. If none are installed, every missing entry is listed.
-pub fn missing_optional_hw_decoder_install_hints() -> Vec<String> {
+/// Returns [`None`] when every optional decoder we care about is present.
+pub fn missing_optional_hw_decoders_cli() -> Option<MissingOptionalHwDecodersCli> {
     let _ = init_gstreamer();
     let registry = gst::Registry::get();
 
@@ -113,7 +134,7 @@ pub fn missing_optional_hw_decoder_install_hints() -> Vec<String> {
         }
     }
 
-    let mut out = Vec::new();
+    let mut detail_lines = Vec::new();
     for (factory, tip) in OPTIONAL_HW_VIDEO_DECODERS {
         let missing = registry
             .find_feature(factory, gst::ElementFactory::static_type())
@@ -125,9 +146,33 @@ pub fn missing_optional_hw_decoder_install_hints() -> Vec<String> {
         if !missing_hw_decoder_hint_in_scope(first_present, factory) {
             continue;
         }
-        out.push(format!("`{}` not found — {}", factory, tip));
+        detail_lines.push(format!("`{}` not found — {}", factory, tip));
     }
-    out
+
+    if detail_lines.is_empty() {
+        return None;
+    }
+
+    let partial_stack = first_present.is_some();
+    let stack_label = stack_label_for_optional_hw(first_present);
+    let count = detail_lines.len();
+
+    Some(MissingOptionalHwDecodersCli {
+        count,
+        stack_label,
+        partial_stack,
+        detail_lines,
+    })
+}
+
+/// One-line hints per **missing** optional hardware decoder plugin (for CLI / UX).
+///
+/// Prefer [`missing_optional_hw_decoders_cli`] for structured output. This returns only the
+/// verbose detail lines.
+pub fn missing_optional_hw_decoder_install_hints() -> Vec<String> {
+    missing_optional_hw_decoders_cli()
+        .map(|c| c.detail_lines)
+        .unwrap_or_default()
 }
 
 /// Initialize GStreamer (call once at startup)
